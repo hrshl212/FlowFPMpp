@@ -6,9 +6,11 @@ program test_stairstep_exact_3d
   !    f=0, phi=g.x minus its fluid mean solves the discrete problem exactly;
   !    the FPM gradients and densities then have closed forms.
   ! 2. FPM influence field (body_grad=e_x, zero outer data): compatibility
-  !    closes, and a fixed-sweep distributed solve equals a single-rank host
-  !    solve of the same problem.
+  !    closes, and a distributed solve equals a single-rank host solve of the
+  !    same problem (Jacobi: fixed sweeps, to roundoff; PCG: converged).
+  ! Both iterations (Jacobi and PCG) are checked.
   use,intrinsic :: iso_fortran_env,only:real64,output_unit,error_unit
+  use,intrinsic :: ieee_arithmetic,only:ieee_is_finite
   use mpi
   use fpm_test_grid
   use fpm_stairstep_mpi_3d
@@ -19,8 +21,10 @@ program test_stairstep_exact_3d
   real(real64),allocatable::phi(:,:,:),phi_ref(:,:,:)
   real(real64)::errors(4),correction,imbalance,residual,check_residual,totals(2),expected(2)
   real(real64)::diff,local,value,ref_totals(2),unused(2)
-  integer::rank,ierr,sweeps,ioff,joff,nx,ny
-  logical::use_gpu,passed
+  character(8),parameter::methods(2)=[character(8)::'jacobi','pcg']
+  real(real64)::tolerance,field_tol
+  integer::rank,ierr,sweeps,ref_sweeps,ioff,joff,nx,ny,m,max_it
+  logical::use_gpu,passed,ok
   character(16)::arg
 
   call MPI_Init(ierr)
@@ -31,40 +35,60 @@ program test_stairstep_exact_3d
   call stretched_axis(gny,0.0_real64,1.0_real64,-0.17_real64,yf,gyc,gdy)
   call stretched_axis(nz,0.0_real64,0.5_real64,0.13_real64,zf,zc,dz)
 
-  ! 1. Exact linear solution.
-  call run_case(MPI_COMM_WORLD,use_gpu,.true.,1.0e-12_real64,400000,phi,ioff,joff,nx,ny, &
-       sweeps,residual,check_residual,correction,imbalance,errors,totals,expected)
-  passed=abs(correction)<1e-13.and.abs(imbalance)<1e-13.and.residual<=1e-12.and.check_residual<1e-9
-  passed=passed.and.errors(1)<1e-9.and.errors(2)<1e-9.and.errors(3)<1e-9.and.errors(4)==0
-  passed=passed.and.maxval(abs(totals-expected))<1e-10
-  if(rank==0)then
-    write(output_unit,'(a,2(es12.4,1x))')'exact case compatibility correction/imbalance: ',correction,imbalance
-    write(output_unit,'(a,i0,a,2(es12.4,1x))')'exact case sweeps: ',sweeps,', residual (solver/independent): ', &
-         residual,check_residual
-    write(output_unit,'(a,4(es12.4,1x))')'exact case errors phi/grad/vortex/solid (Linf): ',errors
-    write(output_unit,'(a,es12.4)')'exact case integral error: ',maxval(abs(totals-expected))
-  endif
+  passed=.true.
+  do m=1,2
+    ! 1. Exact linear solution.
+    ! CG reaches a roundoff floor near 1e-11 here; Jacobi goes lower.
+    tolerance=merge(1e-12_real64,1e-10_real64,m==1)
+    call run_case(MPI_COMM_WORLD,use_gpu,.true.,methods(m),tolerance,400000,phi,ioff,joff,nx,ny, &
+         sweeps,residual,check_residual,correction,imbalance,errors,totals,expected)
+    ! The final residual is recomputed after the gauge shift, which adds roundoff.
+    ok=abs(correction)<1e-13.and.abs(imbalance)<1e-13.and.residual<=2*tolerance.and.check_residual<1e-9
+    ok=ok.and.errors(1)<1e-9.and.errors(2)<1e-9.and.errors(3)<1e-9.and.errors(4)==0
+    ok=ok.and.maxval(abs(totals-expected))<1e-10
+    ! NaN compares false and max() may drop it, so require finite values.
+    ok=ok.and.all(ieee_is_finite([residual,check_residual,errors,totals,expected]))
+    passed=passed.and.ok
+    if(rank==0)then
+      write(output_unit,'(a)')'--- method '//trim(methods(m))
+      write(output_unit,'(a,2(es12.4,1x))')'exact case compatibility correction/imbalance: ',correction,imbalance
+      write(output_unit,'(a,i0,a,2(es12.4,1x))')'exact case iterations: ',sweeps,', residual (solver/independent): ', &
+           residual,check_residual
+      write(output_unit,'(a,4(es12.4,1x))')'exact case errors phi/grad/vortex/solid (Linf): ',errors
+      write(output_unit,'(a,es12.4)')'exact case integral error: ',maxval(abs(totals-expected))
+    endif
 
-  ! 2. FPM influence field, fixed work, distributed versus one host rank.
-  call run_case(MPI_COMM_WORLD,use_gpu,.false.,-1.0_real64,600,phi,ioff,joff,nx,ny, &
-       sweeps,residual,check_residual,correction,imbalance,errors,totals,expected)
-  passed=passed.and.abs(imbalance)<1e-13.and.sweeps==600.and.abs(check_residual-residual)<=1e-8*residual+1e-12
-  call run_case(MPI_COMM_SELF,.false.,.false.,-1.0_real64,600,phi_ref,ioff,joff,nx,ny, &
-       sweeps,value,check_residual,correction,imbalance,errors,ref_totals,unused)
-  ! run_case on MPI_COMM_SELF returns the whole grid; compare this rank's block.
-  call MPI_Comm_rank(MPI_COMM_WORLD,rank,ierr)
-  call block_offsets(ioff,joff)
-  local=maxval(abs(phi(1:size(phi,1)-2,1:size(phi,2)-2,:)- &
-       phi_ref(ioff+1:ioff+size(phi,1)-2,joff+1:joff+size(phi,2)-2,:)))
-  call MPI_Allreduce(local,diff,1,MPI_DOUBLE_PRECISION,MPI_MAX,MPI_COMM_WORLD,ierr)
-  passed=passed.and.diff<1e-13.and.abs(value-residual)<=1e-8*value.and.maxval(abs(totals-ref_totals))<1e-13
-  if(rank==0)then
-    write(output_unit,'(a,es12.4)')'influence case compatibility correction: ',correction
-    write(output_unit,'(a,2(es12.4,1x))')'influence case residual distributed/one rank: ',residual,value
-    write(output_unit,'(a,es12.4)')'influence case distributed versus one-rank field (Linf): ',diff
-    write(output_unit,'(a,2(es22.14,1x))')'influence case vortex/advection integrals: ',totals
-    write(output_unit,'(a,es12.4)')'influence case integral difference versus one rank: ',maxval(abs(totals-ref_totals))
-  endif
+    ! 2. FPM influence field, distributed versus one host rank: identical fixed
+    ! work for Jacobi; converged fields for PCG (its reductions depend on the
+    ! decomposition).
+    if(m==1)then;tolerance=-1;max_it=600;field_tol=1e-13_real64
+    else;tolerance=1e-11_real64;max_it=100000;field_tol=1e-8_real64;endif
+    call run_case(MPI_COMM_WORLD,use_gpu,.false.,methods(m),tolerance,max_it,phi,ioff,joff,nx,ny, &
+         sweeps,residual,check_residual,correction,imbalance,errors,totals,expected)
+    ok=abs(imbalance)<1e-13.and.abs(check_residual-residual)<=1e-8*residual+1e-12
+    if(m==1)ok=ok.and.sweeps==600
+    if(m==2)ok=ok.and.residual<=2e-11
+    call run_case(MPI_COMM_SELF,.false.,.false.,methods(m),tolerance,max_it,phi_ref,ioff,joff,nx,ny, &
+         ref_sweeps,value,check_residual,correction,imbalance,errors,ref_totals,unused)
+    ! run_case on MPI_COMM_SELF returns the whole grid; compare this rank's block.
+    call block_offsets(ioff,joff)
+    local=maxval(abs(phi(1:size(phi,1)-2,1:size(phi,2)-2,:)- &
+         phi_ref(ioff+1:ioff+size(phi,1)-2,joff+1:joff+size(phi,2)-2,:)))
+    call MPI_Allreduce(local,diff,1,MPI_DOUBLE_PRECISION,MPI_MAX,MPI_COMM_WORLD,ierr)
+    ok=ok.and.diff<field_tol.and.maxval(abs(totals-ref_totals))<field_tol
+    ok=ok.and.all(ieee_is_finite([residual,value,check_residual,diff,totals,ref_totals]))
+    ok=ok.and.all(ieee_is_finite(phi(1:size(phi,1)-2,1:size(phi,2)-2,:)))
+    if(m==1)ok=ok.and.abs(value-residual)<=1e-8*value
+    passed=passed.and.ok
+    if(rank==0)then
+      write(output_unit,'(a,es12.4)')'influence case compatibility correction: ',correction
+      write(output_unit,'(a,2(i0,1x),2(es12.4,1x))')'influence case iterations and residual distributed/one rank: ', &
+           sweeps,ref_sweeps,residual,value
+      write(output_unit,'(a,es12.4)')'influence case distributed versus one-rank field (Linf): ',diff
+      write(output_unit,'(a,2(es22.14,1x))')'influence case vortex/advection integrals: ',totals
+      write(output_unit,'(a,es12.4)')'influence case integral difference versus one rank: ',maxval(abs(totals-ref_totals))
+    endif
+  enddo
   if(.not.passed)then
     if(rank==0)write(error_unit,'(a)')'FAIL: stair-step exactness and decomposition test'
     call MPI_Abort(MPI_COMM_WORLD,1,ierr)
@@ -87,10 +111,11 @@ contains
     call MPI_Comm_free(cart,ierr)
   end subroutine block_offsets
 
-  subroutine run_case(comm,gpu,exact,tolerance,max_sweeps,phi,ioff,joff,nx,ny, &
+  subroutine run_case(comm,gpu,exact,method,tolerance,max_sweeps,phi,ioff,joff,nx,ny, &
        sweeps,residual,check_residual,correction,imbalance,errors,totals,expected)
     integer,intent(in)::comm,max_sweeps
     logical,intent(in)::gpu,exact
+    character(*),intent(in)::method
     real(real64),intent(in)::tolerance
     real(real64),allocatable,intent(inout)::phi(:,:,:)
     integer,intent(out)::ioff,joff,nx,ny,sweeps
@@ -122,7 +147,8 @@ contains
     call enforce_stairstep_compatibility_3d(rhs,solid,body,xlo,xhi,ylo,yhi,zlo,zhi,dx,dy,dz, &
          nx,ny,nz,west,east,south,north,cart,correction,imbalance)
     call solve_stairstep_poisson_3d(phi,rhs,solid,body,xlo,xhi,ylo,yhi,zlo,zhi,xc,yc,zc,dx,dy,dz, &
-         nx,ny,nz,west,east,south,north,cart,tolerance,max_sweeps,50,sweeps,residual,use_openacc=gpu)
+         nx,ny,nz,west,east,south,north,cart,tolerance,max_sweeps,50,sweeps,residual,use_openacc=gpu, &
+         method=trim(method))
     check_residual=stairstep_residual_3d(phi,rhs,solid,body,xlo,xhi,ylo,yhi,zlo,zhi,xc,yc,zc,dx,dy,dz, &
          nx,ny,nz,west,east,south,north,cart)
     allocate(u(nx,ny,nz),v(nx,ny,nz),w(nx,ny,nz),ox(nx,ny,nz),oy(nx,ny,nz),oz(nx,ny,nz))

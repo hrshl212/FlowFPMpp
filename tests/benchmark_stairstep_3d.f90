@@ -2,7 +2,10 @@ program benchmark_stairstep_3d
   ! Public fixed-work benchmark: the x influence field of a stair-step sphere on
   ! a mildly stretched grid (compatibility + Jacobi sweeps + gauge), then the
   ! FPM volume terms from synthetic velocity and vorticity fields.
-  ! Usage: benchmark_stairstep_3d [mode [gnx gny nz [sweeps]]]
+  ! Usage: benchmark_stairstep_3d [mode [gnx gny nz [iterations [method [tolerance]]]]]
+  !   method jacobi (default, fixed-work bandwidth study) or pcg
+  !   tolerance > 0: time to solution (stop at that max-norm residual, checked
+  !   every 100 iterations, with iterations as the cap); default: fixed work
   !   mode benchmark: CPU and GPU runs with a parity check (default)
   !   mode cpu:       CPU only (any rank count whose layout divides the grid)
   !   mode gpu:       GPU only (for profiling)
@@ -26,10 +29,11 @@ program benchmark_stairstep_3d
   integer,allocatable::solid(:,:,:)
   real(real64)::body(3),bounds(6),lz,radius,center(3),t_solve(repeats,2),t_terms(repeats,2)
   real(real64)::totals(2),totals_cpu(2),residual,local(3),global(3),linf,rel_l2,setup_start,setup_seconds
+  real(real64)::tolerance
   integer::gnx,gny,nz,nsweep,rank,nproc,ierr,cart,nx,ny,ioff,joff,west,east,south,north,i,j,k,r,sweeps
   integer(8)::nsolid,nsolid_local
-  character(16)::mode,arg
-  mode='benchmark';gnx=256;gny=256;nz=64;nsweep=250
+  character(16)::mode,arg,method
+  mode='benchmark';gnx=256;gny=256;nz=64;nsweep=250;method='jacobi';tolerance=-1
   if(command_argument_count()>0)call get_command_argument(1,mode)
   if(all(trim(mode)/=[character(16)::'benchmark','cpu','gpu']))error stop 'mode must be benchmark, cpu, or gpu'
   if(command_argument_count()>=4)then
@@ -38,6 +42,8 @@ program benchmark_stairstep_3d
     call get_command_argument(4,arg);read(arg,*)nz
   endif
   if(command_argument_count()>=5)then;call get_command_argument(5,arg);read(arg,*)nsweep;endif
+  if(command_argument_count()>=6)call get_command_argument(6,method)
+  if(command_argument_count()>=7)then;call get_command_argument(7,arg);read(arg,*)tolerance;endif
   call MPI_Init(ierr)
   setup_start=MPI_Wtime()
   call MPI_Comm_rank(MPI_COMM_WORLD,rank,ierr);call MPI_Comm_size(MPI_COMM_WORLD,nproc,ierr)
@@ -74,7 +80,11 @@ program benchmark_stairstep_3d
   if(rank==0)then
     write(output_unit,'(a,3(i0,1x),a,i0,a)')'grid nx ny nz: ',gnx,gny,nz,'(',int(gnx,8)*gny*nz,' cells)'
     write(output_unit,'(a,i0,a,i0)')'MPI ranks: ',nproc,', solid cells: ',nsolid
-    write(output_unit,'(a,i0)')'fixed Jacobi sweeps: ',nsweep
+    if(tolerance>0)then
+      write(output_unit,'(a,a,a,es10.3,a,i0)')'method ',trim(method),', tolerance ',tolerance,', iteration cap ',nsweep
+    else
+      write(output_unit,'(a,a,a,i0)')'method ',trim(method),', fixed iterations: ',nsweep
+    endif
     write(output_unit,'(a,f10.4)')'input setup seconds: ',setup_seconds
   endif
   t_solve=0;t_terms=0
@@ -90,7 +100,7 @@ program benchmark_stairstep_3d
   local(1)=sum(phi(1:nx,1:ny,:));local(2)=sum(abs(phi(1:nx,1:ny,:)))
   call MPI_Allreduce(local(1:2),global(1:2),2,MPI_DOUBLE_PRECISION,MPI_SUM,cart,ierr)
   if(rank==0)then
-    write(output_unit,'(a,es14.6)')'final residual: ',residual
+    write(output_unit,'(a,i0,a,es14.6)')'last-run iterations: ',sweeps,', final residual: ',residual
     write(output_unit,'(a,2(es25.17,1x))')'last-run phi checksum (sum, sum abs): ',global(1:2)
     write(output_unit,'(a,2(es22.14,1x))')'vortex/advection integrals: ',totals
     if(trim(mode)/='gpu')write(output_unit,'(a,2(f12.6,1x))')'CPU solve/terms medians (s): ', &
@@ -118,7 +128,9 @@ program benchmark_stairstep_3d
       write(output_unit,'(a,2(f8.2,1x))')'GPU speedup solve/terms: ', &
            median3(t_solve(:,1))/median3(t_solve(:,2)),median3(t_terms(:,1))/median3(t_terms(:,2))
     endif
-    if(linf>1e-10_real64.or.rel_l2>1e-10_real64.or.maxval(abs(totals-totals_cpu))>1e-10_real64)then
+    ! Fixed work is the same arithmetic on both; converged runs agree to the tolerance.
+    if(linf>merge(1e-10_real64,1e-6_real64,tolerance<=0).or.rel_l2>merge(1e-10_real64,1e-6_real64,tolerance<=0) &
+         .or.maxval(abs(totals-totals_cpu))>merge(1e-10_real64,1e-6_real64,tolerance<=0))then
       if(rank==0)write(error_unit,'(a)')'FAIL: CPU/GPU parity'
       call MPI_Abort(cart,3,ierr)
     endif
@@ -141,7 +153,8 @@ contains
     call enforce_stairstep_compatibility_3d(rhs,solid,body,xlo,xhi,ylo,yhi,zlo,zhi,dx,dy,dz, &
          nx,ny,nz,west,east,south,north,cart,correction,imbalance)
     call solve_stairstep_poisson_3d(phi,rhs,solid,body,xlo,xhi,ylo,yhi,zlo,zhi,xc,yc,zc,dx,dy,dz, &
-         nx,ny,nz,west,east,south,north,cart,-1.0_real64,nsweep,nsweep,sweeps,residual,use_openacc=gpu)
+         nx,ny,nz,west,east,south,north,cart,tolerance,nsweep,merge(100,nsweep,tolerance>0),sweeps,residual,use_openacc=gpu, &
+         method=trim(method))
     call MPI_Barrier(cart,ierr)
     t1=MPI_Wtime()
     call compute_stairstep_fpm_terms_3d(phi,u,v,w,ox,oy,oz,ax,ay,az,solid,body,xc,yc,zc,dx,dy,dz, &
@@ -154,7 +167,8 @@ contains
     local_t=[t1-t0,t2-t1]
     call MPI_Allreduce(local_t,global_t,2,MPI_DOUBLE_PRECISION,MPI_MAX,cart,ierr)
     solve_seconds=global_t(1);terms_seconds=global_t(2)
-    if(sweeps/=nsweep)call MPI_Abort(cart,4,ierr)
+    if(tolerance<=0.and.sweeps/=nsweep)call MPI_Abort(cart,4,ierr)
+    if(tolerance>0.and.residual>tolerance)call MPI_Abort(cart,5,ierr)
   end subroutine run_case
 
   pure real(real64) function median3(values)

@@ -1,0 +1,9 @@
+# FlowFPM++ benchmark_stairstep_3d, time to max-norm residual 1e-8 (median of 3 after warm-up),
+# compatibility + solve + gauge + FPM terms including all host-device transfers.
+# Hardware: NVIDIA A100-PCIE-40GB; Intel Xeon Gold 6248R, 16 ranks bound to cores. NVHPC 25.5, -O2 -acc -gpu=cc80.
+grid,method,iterations,frame_s_cpu16,frame_s_a100,frame_s_cpu1
+128x128x32,pcg,1000,0.1853,0.1759,
+256x256x64,pcg,1900,5.194,1.249,57.60
+512x512x64,pcg,3600,49.23,7.112,
+128x128x32,jacobi,226000,19.06,5.329,
+256x256x64,jacobi,908900,,108.76,

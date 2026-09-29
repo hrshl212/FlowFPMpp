@@ -91,13 +91,19 @@ contains
     end subroutine total_flux
   end subroutine enforce_stairstep_compatibility_3d
 
-  ! Weighted Jacobi, phi <- 0.2 phi + 0.8 (sum(a_nb phi_nb) - f) / sum(a_nb),
-  ! over fluid cells, then removal of the global fluid-volume mean. Prescribed
-  ! outer and body face gradients are folded once into a source term, solid and
-  ! outer neighbours are dropped from the diagonal, and solid cells stay at zero,
-  ! so the sweep reads no masks. solid must have a current halo.
+  ! Solves the stair-step pure-Neumann problem over fluid cells, then removes the
+  ! global fluid-volume mean. method selects the iteration:
+  !   'pcg' (default): conjugate gradients on the volume-weighted (symmetric)
+  !     operator with a diagonal preconditioner;
+  !   'jacobi': weighted Jacobi, phi <- 0.2 phi + 0.8 (sum(a_nb phi_nb) - f) / sum(a_nb).
+  ! Both stop when the max-norm residual of L(phi)-f, checked every
+  ! check_interval iterations, is at most tolerance (a negative tolerance runs
+  ! exactly max_sweeps iterations). Prescribed outer and body face gradients are
+  ! folded once into a source term and solid and outer neighbours are dropped
+  ! from the diagonal; solid cells stay at zero, so the kernels read no masks.
+  ! solid must have a current halo.
   subroutine solve_stairstep_poisson_3d(phi,rhs,solid,body_grad,xlo,xhi,ylo,yhi,zlo,zhi,xc,yc,zc,dx,dy,dz, &
-       nx,ny,nz,west,east,south,north,comm,tolerance,max_sweeps,check_interval,sweeps,residual,use_openacc)
+       nx,ny,nz,west,east,south,north,comm,tolerance,max_sweeps,check_interval,sweeps,residual,use_openacc,method)
     integer,intent(in)::nx,ny,nz,west,east,south,north,comm,max_sweeps,check_interval
     integer,intent(in)::solid(0:nx+1,0:ny+1,nz)
     real(real64),intent(inout)::phi(0:nx+1,0:ny+1,nz)
@@ -107,16 +113,24 @@ contains
     integer,intent(out)::sweeps
     real(real64),intent(out)::residual
     logical,intent(in),optional::use_openacc
+    character(*),intent(in),optional::method
     type(halo_workspace_3d)::work
-    real(real64),allocatable::next(:,:,:),src(:,:,:),diag(:,:,:),rdiag(:,:,:)
+    real(real64),allocatable::next(:,:,:),src(:,:,:),diag(:,:,:),rdiag(:,:,:),r(:,:,:),q(:,:,:)
     real(real64),allocatable::cw(:),ce(:),cs(:),cn(:),cb(:),ct(:)
-    real(real64)::local(2),global(2),mean_value,s,d
-    integer::i,j,k,step,nsteps,ierr,isolated
-    logical::accelerate
+    real(real64)::local(2),global(2),mean_value
+    integer::i,j,k,ierr,isolated
+    logical::accelerate,use_pcg
     accelerate=.true.;if(present(use_openacc))accelerate=use_openacc
+    use_pcg=.true.
+    if(present(method))then
+      if(method/='pcg'.and.method/='jacobi')error stop 'stair-step method must be pcg or jacobi'
+      use_pcg=method=='pcg'
+    endif
     if(nx<1.or.ny<1.or.nz<2)error stop 'stair-step solve needs nz>=2 and nonempty ranks'
     call trace_push('stair-step setup')
+    ! next is the second Jacobi buffer or the PCG search direction.
     allocate(next(0:nx+1,0:ny+1,nz),src(nx,ny,nz),diag(nx,ny,nz),rdiag(nx,ny,nz))
+    if(use_pcg)then;allocate(r(nx,ny,nz),q(nx,ny,nz));else;allocate(r(1,1,1),q(1,1,1));endif
     allocate(cw(nx),ce(nx),cs(ny),cn(ny),cb(nz),ct(nz))
     call axis_coefficients(xc,dx,nx,west,east,cw,ce)
     call axis_coefficients(yc,dy,ny,south,north,cs,cn)
@@ -126,11 +140,202 @@ contains
       if(k<nz)ct(k)=1/(dz(k)*(zc(k+1)-zc(k)))
     enddo
     call initialize_halo_workspace_3d(work,nx,ny,nz,1)
-    sweeps=0;residual=huge(1.0_real64);isolated=0
+    sweeps=0;residual=huge(1.0_real64)
     ! Only phi moves between host and device (and is skipped if the caller
     ! already holds it on the device); the operator arrays are built in place.
     !$acc data copy(phi) copyin(rhs,solid,body_grad,xlo,xhi,ylo,yhi,zlo,zhi,cw,ce,cs,cn,cb,ct,dx,dy,dz) &
-    !$acc& create(next,src,diag,rdiag) if(accelerate)
+    !$acc& create(next,src,diag,rdiag,r,q) if(accelerate)
+    call build_operator(rhs,solid,body_grad,xlo,xhi,ylo,yhi,zlo,zhi,cw,ce,cs,cn,cb,ct,dx,dy,dz, &
+         nx,ny,nz,west,east,south,north,use_pcg,src,diag,rdiag,isolated,accelerate)
+    if(isolated>0)error stop 'stair-step fluid cell has no fluid neighbour'
+    ! Solid cells and physical-boundary halos hold zero in phi and next; they
+    ! carry zero weight but must be finite.
+    !$acc parallel loop collapse(3) default(present) if(accelerate)
+    do k=1,nz;do j=0,ny+1;do i=0,nx+1
+      if(solid(i,j,k)/=0.or.(i==0.and.west==MPI_PROC_NULL).or.(i==nx+1.and.east==MPI_PROC_NULL) &
+           .or.(j==0.and.south==MPI_PROC_NULL).or.(j==ny+1.and.north==MPI_PROC_NULL))phi(i,j,k)=0
+      next(i,j,k)=phi(i,j,k)
+    enddo;enddo;enddo
+    !$acc end parallel loop
+    call trace_pop()
+    call trace_push('stair-step iterations')
+    if(use_pcg)then
+      call pcg_iterate()
+    else
+      call jacobi_iterate()
+    endif
+    call trace_pop()
+    call trace_push('stair-step gauge')
+    local=0
+    !$acc parallel loop collapse(3) present(phi,dx,dy,dz,solid) reduction(+:local) if(accelerate)
+    do k=1,nz;do j=1,ny;do i=1,nx
+      if(solid(i,j,k)==0)then
+        local(1)=local(1)+phi(i,j,k)*dx(i)*dy(j)*dz(k)
+        local(2)=local(2)+dx(i)*dy(j)*dz(k)
+      endif
+    enddo;enddo;enddo
+    !$acc end parallel loop
+    call MPI_Allreduce(local,global,2,MPI_DOUBLE_PRECISION,MPI_SUM,comm,ierr)
+    mean_value=global(1)/global(2)
+    !$acc parallel loop collapse(3) present(phi,solid) if(accelerate)
+    do k=1,nz;do j=1,ny;do i=1,nx
+      if(solid(i,j,k)==0)phi(i,j,k)=phi(i,j,k)-mean_value
+    enddo;enddo;enddo
+    !$acc end parallel loop
+    call exchange(phi)
+    residual=operator_residual(phi,src,diag,cw,ce,cs,cn,cb,ct,nx,ny,nz,comm,accelerate)
+    call trace_pop()
+    !$acc end data
+    call finalize_halo_workspace_3d(work)
+    deallocate(next,src,diag,rdiag,r,q,cw,ce,cs,cn,cb,ct)
+  contains
+    subroutine exchange(field)
+      real(real64),intent(inout)::field(0:nx+1,0:ny+1,nz)
+      call exchange_xy_halo_3d(field,nx,ny,nz,1,west,east,south,north,comm,work, &
+           host_only=.not.accelerate,batched_device=accelerate)
+    end subroutine exchange
+
+    ! Ping-pong between phi and next; an odd step count ends with one copy.
+    subroutine jacobi_iterate()
+      integer::step,nsteps,i,j,k,n1,n2,n3
+      n1=nx;n2=ny;n3=nz
+      do while(sweeps<max_sweeps.and.residual>tolerance)
+        nsteps=min(max(1,check_interval),max_sweeps-sweeps)
+        do step=1,nsteps
+          if(mod(step,2)==1)then
+            call exchange(phi)
+            call jacobi_sweep(phi,next,src,rdiag,cw,ce,cs,cn,cb,ct,nx,ny,nz,accelerate)
+          else
+            call exchange(next)
+            call jacobi_sweep(next,phi,src,rdiag,cw,ce,cs,cn,cb,ct,nx,ny,nz,accelerate)
+          endif
+          sweeps=sweeps+1
+        enddo
+        if(mod(nsteps,2)==1)then
+          !$acc parallel loop collapse(3) present(phi,next) if(accelerate)
+          do k=1,n3;do j=1,n2;do i=1,n1
+            phi(i,j,k)=next(i,j,k)
+          enddo;enddo;enddo
+          !$acc end parallel loop
+        endif
+        call exchange(phi)
+        residual=operator_residual(phi,src,diag,cw,ce,cs,cn,cb,ct,nx,ny,nz,comm,accelerate)
+      enddo
+    end subroutine jacobi_iterate
+
+    ! Preconditioned CG on A phi = b with A = V (diag - offdiag) and b = V src,
+    ! where V is the cell volume. A is symmetric positive semidefinite on the
+    ! fluid cells with the constants as null space; compatibility makes b
+    ! orthogonal to it, and every true residual is projected once more to remove
+    ! roundoff. rdiag holds 1/(V diag) (the preconditioner) and next the search
+    ! direction p. At each convergence check the recursively updated residual is
+    ! replaced by the true one (it drifts near roundoff), and a breakdown
+    ! restarts from the steepest-descent direction.
+    subroutine pcg_iterate()
+      real(real64)::rz,rz_new,pq,alpha,beta,vol,res
+      integer::it,i,j,k,ierr,n1,n2,n3,restarts
+      ! The residual is passed back explicitly: NVHPC OpenACC builds did not see
+      ! an update of the host-associated residual made in a sibling procedure.
+      n1=nx;n2=ny;n3=nz
+      call true_residual(.true.,rz,res)
+      it=0;restarts=0
+      do while(sweeps<max_sweeps.and.res>tolerance)
+        call exchange(next)
+        pq=0
+        !$acc parallel loop collapse(3) present(next,q,diag,cw,ce,cs,cn,cb,ct,dx,dy,dz) private(vol) &
+        !$acc& reduction(+:pq) if(accelerate)
+        do k=1,n3;do j=1,n2;do i=1,n1
+          vol=dx(i)*dy(j)*dz(k)
+          q(i,j,k)=merge(vol*(diag(i,j,k)*next(i,j,k)-cw(i)*next(i-1,j,k)-ce(i)*next(i+1,j,k) &
+               -cs(j)*next(i,j-1,k)-cn(j)*next(i,j+1,k)-cb(k)*next(i,j,max(k-1,1)) &
+               -ct(k)*next(i,j,min(k+1,n3))),0.0_real64,diag(i,j,k)>0)
+          pq=pq+next(i,j,k)*q(i,j,k)
+        enddo;enddo;enddo
+        !$acc end parallel loop
+        call MPI_Allreduce(MPI_IN_PLACE,pq,1,MPI_DOUBLE_PRECISION,MPI_SUM,comm,ierr)
+        if(pq<=0.or.rz<=0)then
+          ! Breakdown (converged to roundoff or lost conjugacy): restart once.
+          restarts=restarts+1
+          if(restarts>1)exit
+          call true_residual(.true.,rz,res)
+          cycle
+        endif
+        restarts=0
+        alpha=rz/pq
+        rz_new=0
+        !$acc parallel loop collapse(3) present(phi,next,r,q,rdiag) reduction(+:rz_new) if(accelerate)
+        do k=1,n3;do j=1,n2;do i=1,n1
+          phi(i,j,k)=phi(i,j,k)+alpha*next(i,j,k)
+          r(i,j,k)=r(i,j,k)-alpha*q(i,j,k)
+          rz_new=rz_new+rdiag(i,j,k)*r(i,j,k)*r(i,j,k)
+        enddo;enddo;enddo
+        !$acc end parallel loop
+        call MPI_Allreduce(MPI_IN_PLACE,rz_new,1,MPI_DOUBLE_PRECISION,MPI_SUM,comm,ierr)
+        beta=rz_new/rz;rz=rz_new
+        !$acc parallel loop collapse(3) present(next,r,rdiag) if(accelerate)
+        do k=1,n3;do j=1,n2;do i=1,n1
+          next(i,j,k)=rdiag(i,j,k)*r(i,j,k)+beta*next(i,j,k)
+        enddo;enddo;enddo
+        !$acc end parallel loop
+        sweeps=sweeps+1;it=it+1
+        if(mod(it,max(1,check_interval))==0.or.sweeps==max_sweeps)call true_residual(.false.,rz,res)
+      enddo
+      residual=res
+    end subroutine pcg_iterate
+
+    ! Sets r to the projected true residual b - A phi, rz to r.M^-1 r, and res
+    ! to the max-norm residual of L(phi)-f; reset also sets p = M^-1 r.
+    subroutine true_residual(reset,rz,res)
+      logical,intent(in)::reset
+      real(real64),intent(out)::rz,res
+      real(real64)::red(2),gred(2),vol,shift
+      integer::i,j,k,ierr,n1,n2,n3
+      n1=nx;n2=ny;n3=nz
+      call exchange(phi)
+      res=operator_residual(phi,src,diag,cw,ce,cs,cn,cb,ct,nx,ny,nz,comm,accelerate)
+      red=0
+      !$acc parallel loop collapse(3) present(phi,src,diag,cw,ce,cs,cn,cb,ct,dx,dy,dz,r) private(vol) &
+      !$acc& reduction(+:red) if(accelerate)
+      do k=1,n3;do j=1,n2;do i=1,n1
+        r(i,j,k)=0
+        if(diag(i,j,k)>0)then
+          vol=dx(i)*dy(j)*dz(k)
+          r(i,j,k)=vol*(src(i,j,k)+cw(i)*phi(i-1,j,k)+ce(i)*phi(i+1,j,k)+cs(j)*phi(i,j-1,k) &
+               +cn(j)*phi(i,j+1,k)+cb(k)*phi(i,j,max(k-1,1))+ct(k)*phi(i,j,min(k+1,n3))-diag(i,j,k)*phi(i,j,k))
+          red(1)=red(1)+r(i,j,k);red(2)=red(2)+1
+        endif
+      enddo;enddo;enddo
+      !$acc end parallel loop
+      call MPI_Allreduce(red,gred,2,MPI_DOUBLE_PRECISION,MPI_SUM,comm,ierr)
+      shift=gred(1)/gred(2)
+      rz=0
+      !$acc parallel loop collapse(3) present(r,rdiag,diag,next) reduction(+:rz) if(accelerate)
+      do k=1,n3;do j=1,n2;do i=1,n1
+        if(diag(i,j,k)>0)r(i,j,k)=r(i,j,k)-shift
+        if(reset)next(i,j,k)=rdiag(i,j,k)*r(i,j,k)
+        rz=rz+rdiag(i,j,k)*r(i,j,k)*r(i,j,k)
+      enddo;enddo;enddo
+      !$acc end parallel loop
+      call MPI_Allreduce(MPI_IN_PLACE,rz,1,MPI_DOUBLE_PRECISION,MPI_SUM,comm,ierr)
+    end subroutine true_residual
+  end subroutine solve_stairstep_poisson_3d
+
+  ! Source term, diagonal, and inverse-diagonal factor of the stair-step
+  ! operator (all zero in solid cells), built where the arrays live. rdiag is
+  ! 0.8/diag for Jacobi and 1/(V diag) for PCG. isolated counts fluid cells
+  ! without any fluid neighbour.
+  subroutine build_operator(rhs,solid,body_grad,xlo,xhi,ylo,yhi,zlo,zhi,cw,ce,cs,cn,cb,ct,dx,dy,dz, &
+       nx,ny,nz,west,east,south,north,for_pcg,src,diag,rdiag,isolated,accelerate)
+    integer,intent(in)::nx,ny,nz,west,east,south,north,solid(0:nx+1,0:ny+1,nz)
+    real(real64),intent(in)::rhs(nx,ny,nz),body_grad(3)
+    real(real64),intent(in)::xlo(ny,nz),xhi(ny,nz),ylo(nx,nz),yhi(nx,nz),zlo(nx,ny),zhi(nx,ny)
+    real(real64),intent(in)::cw(nx),ce(nx),cs(ny),cn(ny),cb(nz),ct(nz),dx(nx),dy(ny),dz(nz)
+    logical,intent(in)::for_pcg,accelerate
+    real(real64),intent(out)::src(nx,ny,nz),diag(nx,ny,nz),rdiag(nx,ny,nz)
+    integer,intent(out)::isolated
+    real(real64)::s,d
+    integer::i,j,k
+    isolated=0
     !$acc parallel loop collapse(3) default(present) private(s,d) reduction(+:isolated) if(accelerate)
     do k=1,nz;do j=1,ny;do i=1,nx
       s=0;d=0
@@ -157,73 +362,12 @@ contains
         if(d<=0)isolated=isolated+1
       endif
       src(i,j,k)=s;diag(i,j,k)=d
-      rdiag(i,j,k)=merge(0.8_real64/d,0.0_real64,d>0)
+      if(d<=0)then;rdiag(i,j,k)=0
+      elseif(for_pcg)then;rdiag(i,j,k)=1/(dx(i)*dy(j)*dz(k)*d)
+      else;rdiag(i,j,k)=0.8_real64/d;endif
     enddo;enddo;enddo
     !$acc end parallel loop
-    if(isolated>0)error stop 'stair-step fluid cell has no fluid neighbour'
-    ! Solid cells and physical-boundary halos hold zero in both sweep buffers;
-    ! they carry zero weight but must be finite.
-    !$acc parallel loop collapse(3) default(present) if(accelerate)
-    do k=1,nz;do j=0,ny+1;do i=0,nx+1
-      if(solid(i,j,k)/=0.or.(i==0.and.west==MPI_PROC_NULL).or.(i==nx+1.and.east==MPI_PROC_NULL) &
-           .or.(j==0.and.south==MPI_PROC_NULL).or.(j==ny+1.and.north==MPI_PROC_NULL))phi(i,j,k)=0
-      next(i,j,k)=phi(i,j,k)
-    enddo;enddo;enddo
-    !$acc end parallel loop
-    call trace_pop()
-    call trace_push('stair-step sweeps')
-    do while(sweeps<max_sweeps.and.residual>tolerance)
-      nsteps=min(max(1,check_interval),max_sweeps-sweeps)
-      ! Ping-pong between phi and next; an odd step count ends with one copy.
-      do step=1,nsteps
-        if(mod(step,2)==1)then
-          call exchange_xy_halo_3d(phi,nx,ny,nz,1,west,east,south,north,comm,work, &
-               host_only=.not.accelerate,batched_device=accelerate)
-          call jacobi_sweep(phi,next,src,rdiag,cw,ce,cs,cn,cb,ct,nx,ny,nz,accelerate)
-        else
-          call exchange_xy_halo_3d(next,nx,ny,nz,1,west,east,south,north,comm,work, &
-               host_only=.not.accelerate,batched_device=accelerate)
-          call jacobi_sweep(next,phi,src,rdiag,cw,ce,cs,cn,cb,ct,nx,ny,nz,accelerate)
-        endif
-        sweeps=sweeps+1
-      enddo
-      if(mod(nsteps,2)==1)then
-        !$acc parallel loop collapse(3) present(phi,next) if(accelerate)
-        do k=1,nz;do j=1,ny;do i=1,nx
-          phi(i,j,k)=next(i,j,k)
-        enddo;enddo;enddo
-        !$acc end parallel loop
-      endif
-      call exchange_xy_halo_3d(phi,nx,ny,nz,1,west,east,south,north,comm,work, &
-           host_only=.not.accelerate,batched_device=accelerate)
-      residual=operator_residual(phi,src,diag,cw,ce,cs,cn,cb,ct,nx,ny,nz,comm,accelerate)
-    enddo
-    call trace_pop()
-    call trace_push('stair-step gauge')
-    local=0
-    !$acc parallel loop collapse(3) present(phi,dx,dy,dz,solid) reduction(+:local) if(accelerate)
-    do k=1,nz;do j=1,ny;do i=1,nx
-      if(solid(i,j,k)==0)then
-        local(1)=local(1)+phi(i,j,k)*dx(i)*dy(j)*dz(k)
-        local(2)=local(2)+dx(i)*dy(j)*dz(k)
-      endif
-    enddo;enddo;enddo
-    !$acc end parallel loop
-    call MPI_Allreduce(local,global,2,MPI_DOUBLE_PRECISION,MPI_SUM,comm,ierr)
-    mean_value=global(1)/global(2)
-    !$acc parallel loop collapse(3) present(phi,solid) if(accelerate)
-    do k=1,nz;do j=1,ny;do i=1,nx
-      if(solid(i,j,k)==0)phi(i,j,k)=phi(i,j,k)-mean_value
-    enddo;enddo;enddo
-    !$acc end parallel loop
-    call exchange_xy_halo_3d(phi,nx,ny,nz,1,west,east,south,north,comm,work, &
-         host_only=.not.accelerate,batched_device=accelerate)
-    residual=operator_residual(phi,src,diag,cw,ce,cs,cn,cb,ct,nx,ny,nz,comm,accelerate)
-    call trace_pop()
-    !$acc end data
-    call finalize_halo_workspace_3d(work)
-    deallocate(next,src,diag,rdiag,cw,ce,cs,cn,cb,ct)
-  end subroutine solve_stairstep_poisson_3d
+  end subroutine build_operator
 
   ! One weighted-Jacobi sweep from a (with current halos) into b. Solid cells
   ! have src=rdiag=0 and a=0, so they stay zero; solid and outer neighbours

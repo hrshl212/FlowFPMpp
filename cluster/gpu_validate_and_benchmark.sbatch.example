@@ -23,5 +23,8 @@ mpirun -np 1 ./build_acc/test_stairstep_sphere_3d openacc extended
 # Fixed-work benchmark: CPU/GPU parity on one rank, then a 16-rank CPU baseline.
 mpirun -np 1 --bind-to core ./build_acc/benchmark_stairstep_3d benchmark 256 256 64 250
 mpirun -np 16 --bind-to core ./build_acc/benchmark_stairstep_3d cpu 256 256 64 250
-# Demo data for examples/plot_demo.py.
+# Time to solution with PCG (tolerance 1e-8).
+mpirun -np 1 ./build_acc/benchmark_stairstep_3d gpu 256 256 64 4000000 pcg 1e-8
+# Demo and real-frame example outputs for examples/plot_fields.py.
 mpirun -np 1 ./build_acc/demo_cylinder_vortices gpu 360 240 demo_cylinder_vortices.bin
+mpirun -np 1 ./build_acc/foil_frame_fpm gpu examples/data/foil_frame_18400.bin foil_frame_fpm.bin

@@ -17,3 +17,5 @@ jobs:
         run: make test FC=gfortran
       - name: MPI tests
         run: make mpi-tests FC=gfortran MPIFC=mpifort MPIEXEC="mpirun --oversubscribe"
+      - name: Real-frame example (stair-step foil, PCG)
+        run: make foil FC=gfortran MPIFC=mpifort MPIEXEC="mpirun --oversubscribe"

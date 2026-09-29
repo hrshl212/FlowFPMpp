@@ -1,6 +1,7 @@
-"""Plot the demo_cylinder_vortices output: vorticity and the x/y vortex-induced
-force densities, with influence-potential contour lines (dashed where
-negative) on the force panels. Usage: python plot_demo.py DEMO.bin OUT.png"""
+"""Plot a FlowFPM++ example output (demo_cylinder_vortices or foil_frame_fpm):
+vorticity and the x/y vortex-induced force densities, with influence-potential
+contour lines (dashed where negative) on the force panels.
+Usage: python plot_fields.py IN.bin OUT.png [x0 x1 y0 y1 [vorticity title]]"""
 import sys
 import numpy as np
 import matplotlib
@@ -8,6 +9,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 path, out = sys.argv[1], sys.argv[2]
+window = [float(v) for v in sys.argv[3:7]] if len(sys.argv) >= 7 else [-1.5, 5.5, -1.6, 1.6]
+vorticity_title = sys.argv[7] if len(sys.argv) >= 8 else "Vorticity (synthetic vortex street)"
 with open(path, "rb") as f:
     nx, ny = np.fromfile(f, np.int32, 2)
     xc = np.fromfile(f, float, nx)
@@ -16,23 +19,27 @@ with open(path, "rb") as f:
 
 ink = "#3b3b38"
 panels = [
-    (oz, None, r"$\omega_z$", "Vorticity (synthetic vortex street)"),
+    (oz, None, r"$\omega_z$", vorticity_title),
     (fx, phix, r"$-(\omega\times u)\cdot\nabla\phi_x$", r"Vortex-induced force density, x (drag), with $\phi_x$"),
     (fy, phiy, r"$-(\omega\times u)\cdot\nabla\phi_y$", r"Vortex-induced force density, y (lift), with $\phi_y$"),
 ]
 fig, axes = plt.subplots(3, 1, figsize=(7.5, 8.4), sharex=True, constrained_layout=True)
 for ax, (field, potential, label, title) in zip(axes, panels):
     fluid = np.where(solid > 0, np.nan, field)
-    lim = np.nanpercentile(np.abs(fluid), 99.7)
+    sel = np.ix_((yc >= window[2]) & (yc <= window[3]), (xc >= window[0]) & (xc <= window[1]))
+    lim = np.nanpercentile(np.abs(fluid[sel]), 99.7)
     levels = np.linspace(-lim, lim, 34)  # 33 bins, the middle one centred on zero
     cs = ax.contourf(xc, yc, np.clip(fluid, -lim, lim), levels=levels, cmap="RdBu_r")
     if potential is not None:
         p = np.where(solid > 0, np.nan, potential)
-        ax.contour(xc, yc, p, levels=np.linspace(-0.45, 0.45, 10), colors="#6f6f6b", linewidths=0.5)
+        inside = (xc >= window[0]) & (xc <= window[1])
+        rows = (yc >= window[2]) & (yc <= window[3])
+        plim = np.nanpercentile(np.abs(p[np.ix_(rows, inside)]), 99)
+        ax.contour(xc, yc, p, levels=np.linspace(-plim, plim, 10), colors="#6f6f6b", linewidths=0.5)
     ax.contourf(xc, yc, solid, levels=[0.5, 1.5], colors=["#8a8a86"])
     ax.set_aspect("equal")
-    ax.set_xlim(-1.5, 5.5)
-    ax.set_ylim(-1.6, 1.6)
+    ax.set_xlim(window[0], window[1])
+    ax.set_ylim(window[2], window[3])
     ax.set_title(title, loc="left", fontsize=10.5, color=ink)
     ax.set_ylabel("y", color=ink)
     ax.tick_params(colors=ink, labelsize=8)

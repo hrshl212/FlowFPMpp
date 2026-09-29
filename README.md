@@ -3,13 +3,14 @@
 Force-partitioning influence fields and vortex-induced forces on CPUs and
 NVIDIA GPUs, in Fortran 2018 with MPI and OpenACC.
 
-![Vorticity and vortex-induced force density around a stair-step cylinder](docs/images/demo_cylinder_vortices.png)
+![Vorticity and vortex-induced force densities around a flapping foil](docs/images/foil_frame_stairstep.png)
 
-*Demo (`examples/`): a stair-step cylinder in a synthetic street of
-Lamb-Oseen vortices. Top: vorticity. Middle and bottom: vortex-induced force
+*Real data, reproducible from this repository (`make foil`): one frame of a
+2-D flapping-foil simulation computed with the VICAR3D code, with the foil as
+a stair-step body. Top: vorticity. Middle and bottom: vortex-induced force
 density for drag and lift, with the influence potentials phi_x and phi_y as
-contour lines (dashed where negative). The flow is a prescribed kinematic
-input, not a Navier-Stokes solution.*
+contour lines (dashed where negative). Tens of seconds on one CPU core, about
+2 s on one A100.*
 
 ## What it computes
 
@@ -49,9 +50,16 @@ surface terms of the full FPM decomposition.
   flux to balance. One uniform correction to the outer-boundary data enforces
   this (it is zero to roundoff for a closed body).
 - **Gauge.** The fluid-volume mean of `phi` is removed.
-- **Solver.** Weighted Jacobi,
-  `phi <- 0.2 phi + 0.8 (sum(a_nb phi_nb) - f) / sum(a_nb)`. The damping
-  removes the checkerboard two-cycle of plain Jacobi on this operator.
+- **Solvers.** The default is preconditioned conjugate gradients (PCG).
+  Scaled by cell volume, the operator is symmetric positive semidefinite, with
+  the constants as its null space. Compatibility keeps the right-hand side
+  orthogonal to them, and a diagonal preconditioner is applied. At every
+  convergence check the recursively updated residual is replaced by the true
+  one, which keeps the iteration stable near roundoff. The alternative is
+  weighted Jacobi, `phi <- 0.2 phi + 0.8 (sum(a_nb phi_nb) - f) / sum(a_nb)`,
+  whose damping removes the checkerboard two-cycle of plain Jacobi on this
+  operator. Jacobi is kept as the bandwidth benchmark. Both stop on the same
+  max-norm residual of `L(phi) - f`.
 - **Force terms.** Cell gradients are the average of the two face gradients
   on each axis, using the prescribed values on outer and body faces.
 
@@ -62,8 +70,8 @@ surface terms of the full FPM decomposition.
   comparisons use the same algorithm and memory layout.
 - **Mask-free sweep.** Prescribed outer and body face gradients are folded
   once into a source array, and solid and outer neighbours are dropped from a
-  precomputed diagonal. Solid cells stay at zero, so the Jacobi kernel reads
-  no masks and has no branches.
+  precomputed diagonal. Solid cells stay at zero, so the Jacobi and PCG kernels
+  read no masks.
 - **Device-resident frame.** The operator arrays are built on the device, and
   the sweeps ping-pong between two buffers. Unknowns already on the device are
   not copied again, so a caller's data region can keep the flow fields and
@@ -74,12 +82,13 @@ surface terms of the full FPM decomposition.
 - **MPI.** 2-D (x-y) Cartesian decomposition with host-staged halo messages;
   z is not decomposed.
 - **Double precision** throughout.
-- **Instrumented.** NVTX ranges mark setup, sweeps, gauge, and the force-term
-  kernel. They compile to no-ops in CPU builds.
+- **Instrumented.** NVTX ranges mark setup, iterations, gauge, and the
+  force-term kernel. They compile to no-ops in CPU builds.
 
 ## Validation
 
-Every test generates its own inputs; none needs external data.
+Every test generates its own inputs; none needs external data. Tests check
+both solvers and fail on any non-finite value.
 
 **Exact discrete solution** (`tests/test_stairstep_exact_3d.f90`). The grid is
 stretched, 24x20x10, with four blocked bodies, one of them touching the outer
@@ -88,13 +97,12 @@ field `phi = g . x` solves the discrete problem exactly, and its gradient and
 force densities have closed forms. The test checks this on 1, 4, and 6 ranks
 on the CPU, and on 1 and 4 ranks on the GPU:
 
-| Quantity | Max error |
-|---|---|
-| phi (converged to residual 1e-12) | 1.0e-13 |
-| Gradient | 3.4e-13 |
-| Vortex density | 2.9e-13 |
-| Integrated terms | 3.3e-15 |
-| Distributed vs one-rank field (600 fixed sweeps) | 3.6e-16 |
+| Quantity | Jacobi (to 1e-12, 14,500 sweeps) | PCG (to 1e-10, 200 iterations) |
+|---|---|---|
+| phi | 1.0e-13 | 9.9e-14 |
+| Gradient | 3.4e-13 | 5.9e-13 |
+| Vortex density | 2.9e-13 | 7.0e-13 |
+| Distributed vs one-rank field | 3.6e-16 (600 fixed sweeps) | 6.7e-16 (converged) |
 
 **Sphere convergence** (`tests/test_stairstep_sphere_3d.f90`). The x
 influence potential of a sphere of radius `a` is the dipole
@@ -102,20 +110,31 @@ influence potential of a sphere of radius `a` is the dipole
 the box `[-3a, 3a]^3` and compares the fluid field with it. The added-mass
 coefficient `C_m = -(1/V) * integral(phi n_x dA)` has the exact value 1/2.
 
-| N^3 | Sweeps | RMS error | Far-field (r > 2a) max error | C_m |
+| N^3 | PCG iterations (Jacobi sweeps) | RMS error | Far-field (r > 2a) max error | C_m |
 |---|---|---|---|---|
-| 12 | 2,100 | 1.08e-2 | 2.24e-2 | 0.897 |
-| 24 | 8,800 | 9.27e-3 | 1.87e-2 | 0.770 |
-| 48 | 35,600 | 4.56e-3 | 9.21e-3 | 0.639 |
-| 96 | 143,000 | 2.14e-3 | 4.38e-3 | 0.566 |
+| 12 | 100 (2,100) | 1.08e-2 | 2.24e-2 | 0.897 |
+| 24 | 200 (8,800) | 9.27e-3 | 1.87e-2 | 0.770 |
+| 48 | 300 (35,600) | 4.56e-3 | 9.21e-3 | 0.639 |
+| 96 | 500 (143,000) | 2.14e-3 | 4.38e-3 | 0.566 |
 
 The observed order approaches 1 for all three quantities (1.09, 1.07, and
 1.06 on the finest refinement). That is the expected accuracy of a
 stair-step body: usable, but a sharp-interface method would be needed for
 precise surface quantities.
 
+**Real frame** (`examples/foil_frame_fpm.f90`, `make foil`). The frame is
+cropped to 741x518 cells around the foil and wake, and 2,597 of them are
+solid. The influence fields are solved on the cropped domain, with zero normal
+derivative on its outer boundary. The stair-step x vortex-induced force over
+the crop is -2.131e-2 (per unit span and density). The VICAR3D code's own
+value for the same crop is -1.788e-2. Its influence field comes from the full
+domain and a sharp-interface body. The 19% difference combines the crop and
+the stair-step body, and shows what the simpler geometry costs on a real,
+thin foil. CPU and GPU give identical integrals to eight digits.
+
 **CPU/GPU parity.** On every benchmark grid the GPU field matches the CPU
-field to a maximum difference of 2.8e-17 (relative L2 at most 1.4e-15).
+field to a maximum difference of 2.8e-17 for fixed work, and 2.5e-16 for PCG
+converged to 1e-8.
 Results are reproducible only to roundoff, because the order of GPU
 reductions varies from run to run.
 
@@ -131,9 +150,23 @@ Workload: `benchmark_stairstep_3d`, the x influence field of a stair-step
 sphere on a stretched grid followed by the FPM terms. Times are medians of
 three runs after a warm-up.
 
-**Per-sweep cost** is what a converged solve spends its time on, since those
-take 10^4 to 10^6 sweeps. It is measured as the difference between the
-2,500-sweep and 250-sweep solve times, divided by 2,250.
+**Time to solution** (compatibility, solve to max-norm residual 1e-8, gauge,
+and force terms, including all host-device transfers):
+
+| Grid | PCG iterations | PCG, 16 ranks | PCG, A100 | A100 vs 16 ranks | Jacobi, A100 |
+|---|---|---|---|---|---|
+| 128x128x32 | 1,000 | 0.185 s | 0.176 s | 1.1x | 5.33 s (226,000 sweeps) |
+| 256x256x64 | 1,900 | 5.19 s | 1.25 s | 4.2x | 109 s (908,900 sweeps) |
+| 512x512x64 | 3,600 | 49.2 s | 7.11 s | 6.9x | - |
+
+PCG reaches the tolerance 30-90x sooner than Jacobi. On one CPU core the
+256x256x64 PCG solve takes 57.6 s (46x slower than the A100). Each A100 PCG
+iteration costs about 0.65 ms at 256x256x64. Its three kernels and two global
+reductions move about 14 fields' worth of data, so the iteration runs at
+roughly 60% of peak bandwidth.
+
+**Jacobi per-sweep cost**, as a bandwidth benchmark: the difference between
+the 2,500-sweep and 250-sweep solve times, divided by 2,250.
 
 | Grid | Cells | 1 core | 16 ranks | A100 | A100 vs 16 ranks | A100 vs 1 core |
 |---|---|---|---|---|---|---|
@@ -146,8 +179,8 @@ On the two largest grids the A100 sustains 36-39 billion cell updates per
 second. That is about 1.2 TB/s of memory traffic at 32 bytes per cell, or
 75-81% of the card's 1.555 TB/s peak, so the sweep is bandwidth-bound.
 
-**A complete short frame** (compatibility, 250 sweeps, gauge, and force
-terms, including every host-device transfer):
+**A short fixed-work frame** (compatibility, 250 Jacobi sweeps, gauge, and
+force terms, including every host-device transfer):
 
 | Grid | 1 core | 16 ranks | A100 |
 |---|---|---|---|
@@ -158,7 +191,8 @@ terms, including every host-device transfer):
 
 For short solves the GPU is limited by pageable host-device transfers of the
 input fields, and 16 CPU ranks win on the small grids, which fit in the CPU
-caches. Raw data: [`benchmarks/stairstep_benchmark.csv`](benchmarks/stairstep_benchmark.csv).
+caches. Raw data: [`benchmarks/stairstep_benchmark.csv`](benchmarks/stairstep_benchmark.csv)
+and [`benchmarks/pcg_time_to_solution.csv`](benchmarks/pcg_time_to_solution.csv).
 
 ### Optimization log
 
@@ -172,19 +206,31 @@ fields agreed to roundoff.
 | Solver setup ran on the host, and its source, diagonal, and inverse-diagonal arrays were uploaded on every solve | Build them on the device from the solid flags and face data | Included in the frame times below |
 | The force-term call uploaded 11 fields (about 77 ms) and downloaded 5 (about 43 ms) around a 0.7 ms kernel | Frame-level data region: fields and phi stay resident between the solve and the terms | Terms 0.113 s to 0.022 s (256x256x64) and 0.442 s to 0.089 s (512x512x64) |
 | Combined | | 250-sweep frame 0.300 s to 0.180 s (256x256x64) and 1.158 s to 0.708 s (512x512x64) |
+| Jacobi needs O(N^2) sweeps (908,900 at 256x256x64) | Preconditioned conjugate gradients | Time to 1e-8: 108.8 s to 1.25 s at 256x256x64; demo 71 s to 0.6 s |
+
+Two correctness problems were found on the way and fixed:
+- **CG residual drift.** The recursively updated CG residual drifted from the
+  true one near roundoff. Fix: replace it with the true residual at every
+  check.
+- **Unseen stop condition.** In the NVHPC OpenACC build, the CG loop did not see
+  a stop condition that was updated through Fortran host association in a
+  sibling procedure, so it iterated into NaN. Fix: the residual is now passed
+  back as an argument. The tests now reject non-finite values, which
+  initially let that failure through.
 
 ## Limitations
 
 - **Stair-step geometry.** The body is represented to first order near its
   surface (see the sphere study); surface-sensitive quantities converge slowly.
-- **Jacobi.** The solver needs O(N^2) sweeps to converge; the demo takes
-  about two million sweeps. Multigrid or Krylov acceleration is the obvious
-  next step and would change the performance picture.
+- **Solver.** Diagonal-preconditioned CG still needs O(N) iterations. A
+  multigrid preconditioner would cut this further.
 - **Scaling not measured beyond one GPU.** MPI messages are host-staged (no
   GPU-aware MPI), and multi-GPU scaling has not been measured.
 - **Volume terms only.** The code computes the vortex-induced and advection
   volume terms, not the surface terms of the full FPM decomposition.
-- **Synthetic demo.** The demo flow is kinematic, not a flow solution.
+- **Synthetic demo.** The cylinder demo's flow is kinematic, not a flow solution.
+- **Cropped real frame.** The example frame is a crop, and its outer boundary
+  affects phi.
 
 ## Background
 
@@ -197,21 +243,31 @@ core, benchmark, and tests in this repository are new.
 
 ![Vorticity and x-direction vortex-induced force density around a flapping foil](docs/images/vicar3d_foil_frame.png)
 
-*A production case: one frame (timestep 18400) of a 2-D flapping-foil
-simulation computed with the VICAR3D code. Top: vorticity. Bottom: the
-x-direction vortex-induced force density, evaluated from the saved fields by
-the private postprocessor with the same FPM volume-term formula as here. Its
-integral matches the stored VICAR3D result to 2e-15. The simulation data are
-not distributed.*
+*The same frame (timestep 18400) as evaluated by the private postprocessor,
+with the influence field of the VICAR3D code on the full domain. Top:
+vorticity. Bottom: x-direction vortex-induced force density; its integral
+matches the stored VICAR3D result to 2e-15. Compare the middle panel of the
+figure at the top of this page.*
+
+![Vorticity and vortex-induced force density around a stair-step cylinder](docs/images/demo_cylinder_vortices.png)
+
+*Synthetic demo (`examples/demo_cylinder_vortices.f90`): a stair-step
+cylinder in a street of Lamb-Oseen vortices, a prescribed kinematic flow.
+0.6 s on one A100, 2 s on one CPU core.*
 
 ## Build and run
 
-CPU tests use GNU Fortran and Open MPI (Intel `ifx`/`mpiifort` also work):
+CPU build, tests, and the real-frame example use GNU Fortran and Open MPI
+(Intel `ifx`/`mpiifort` also work):
 
 ```sh
 make test FC=gfortran
 make mpi-tests FC=gfortran MPIFC=mpifort MPIEXEC="mpirun --oversubscribe"
+make foil FC=gfortran MPIFC=mpifort             # writes foil_frame_fpm.bin
+python examples/plot_fields.py foil_frame_fpm.bin foil.png 59 67 66.9 69.4 "Vorticity"
 ```
+
+The plotting script needs numpy and matplotlib.
 
 GPU build (NVIDIA HPC SDK with its bundled MPI):
 
@@ -220,13 +276,26 @@ make acc ACCGPU=cc80                     # cc80 = A100
 mpirun -np 1 ./build_acc/test_stairstep_exact_3d openacc
 mpirun -np 1 ./build_acc/test_stairstep_sphere_3d openacc extended
 mpirun -np 1 ./build_acc/benchmark_stairstep_3d benchmark 256 256 64 250
+mpirun -np 1 ./build_acc/benchmark_stairstep_3d gpu 256 256 64 4000000 pcg 1e-8
+mpirun -np 1 ./build_acc/foil_frame_fpm gpu
 mpirun -np 1 ./build_acc/demo_cylinder_vortices gpu 360 240 demo.bin
-python examples/plot_demo.py demo.bin demo.png      # needs numpy + matplotlib
+python examples/plot_fields.py demo.bin demo.png
 ```
 
-Benchmark usage is `benchmark_stairstep_3d [benchmark|cpu|gpu] [nx ny nz [sweeps]]`.
+Benchmark usage is
+`benchmark_stairstep_3d [benchmark|cpu|gpu] [nx ny nz [iterations [jacobi|pcg [tolerance]]]]`.
+Without a tolerance it runs fixed work.
 `cpu` mode runs on any rank count whose 2-D layout divides the grid. Example
 Slurm scripts with placeholders are in [`cluster/`](cluster/).
+
+### Example data format
+
+`examples/data/foil_frame_18400.bin` (10.8 MB) is a Fortran stream file,
+little-endian: `character(8) 'FFPM2D01'`, `int32 nx, ny`,
+`real64 xf(0:nx), yf(0:ny)` (cell faces), `real64 u(nx,ny), v(nx,ny),
+omega_z(nx,ny)`, and `int32 solid(nx,ny)` (1 inside the foil). Arrays are
+column-major (x fastest). The frame spans x 58.38-67.50 and y 66.80-69.59,
+with widths from 0.0048 to 0.26.
 
 ## Repository layout
 
@@ -234,7 +303,8 @@ Slurm scripts with placeholders are in [`cluster/`](cluster/).
 |---|---|
 | `src/` | Stair-step solver and force terms, halo exchange, serial 3-D kernels, NVTX wrappers |
 | `tests/` | Self-contained tests and the benchmark |
-| `examples/` | Cylinder/vortex-street demo and its plotting script |
+| `examples/` | Real-frame foil example, cylinder demo, plotting script |
+| `examples/data/` | One cropped frame of a VICAR3D flapping-foil simulation (format below) |
 | `benchmarks/` | Measured benchmark results |
 | `docs/` | Provenance statement and figures |
 | `cluster/` | Example Slurm scripts |

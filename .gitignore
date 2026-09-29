@@ -2,9 +2,11 @@ build*/
 *.o
 *.mod
 *.bin
+!examples/data/*.bin
 *.nsys-rep
 *.ncu-rep
 *.sqlite
 *.out
 *.err
 __pycache__/
+*.log

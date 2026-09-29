@@ -15,8 +15,9 @@ if [ -n "${SCAN_EXTRA_PATTERNS:-}" ] && g "$SCAN_EXTRA_PATTERNS"; then report "s
 # (--include must come first: grep keeps unmatched files when the first rule is --exclude.)
 if grep -rInE --include='*.f90' --include=Makefile --include='*.example' --include='*.yml' 'private_inputs' .; then
   report "private data reference in code or scripts"; fi
-big=$(find . -type f -not -path './.git/*' -size +1M); [ -n "$big" ] && { echo "$big"; report "file larger than 1 MB"; }
+# The documented example frame under examples/data is the one allowed large binary.
+big=$(find . -type f -not -path './.git/*' -not -path './examples/data/*.bin' -size +1M); [ -n "$big" ] && { echo "$big"; report "file larger than 1 MB"; }
 # PNG figures are allowed under docs/images; everything else must be text.
-bin=$(find . -type f -not -path './.git/*' -not -path './docs/images/*.png' -exec file {} + | grep -viE 'text|empty' || true); [ -n "$bin" ] && { echo "$bin"; report "non-text file"; }
+bin=$(find . -type f -not -path './.git/*' -not -path './docs/images/*.png' -not -path './examples/data/*.bin' -exec file {} + | grep -viE 'text|empty' || true); [ -n "$bin" ] && { echo "$bin"; report "non-text file"; }
 [ $status = 0 ] && echo "scan clean: $(find . -type f | wc -l) files"
 exit $status

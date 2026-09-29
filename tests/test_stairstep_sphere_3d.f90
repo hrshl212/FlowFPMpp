@@ -10,6 +10,7 @@ program test_stairstep_sphere_3d
   ! the test requires monotone decrease of all three errors and an observed
   ! order above 0.7 for the field errors on the finest refinement.
   use,intrinsic :: iso_fortran_env,only:real64,output_unit,error_unit
+  use,intrinsic :: ieee_arithmetic,only:ieee_is_finite
   use mpi
   use fpm_test_grid
   use fpm_stairstep_mpi_3d
@@ -42,6 +43,7 @@ program test_stairstep_sphere_3d
   endif
   call MPI_Barrier(MPI_COMM_WORLD,ierr)
   passed=all(rms(2:nl)<rms(1:nl-1)).and.all(far(2:nl)<far(1:nl-1))
+  passed=passed.and.all(ieee_is_finite([rms(1:nl),far(1:nl),cm(1:nl)]))
   passed=passed.and.all(abs(cm(2:nl)-0.5_real64)<abs(cm(1:nl-1)-0.5_real64))
   passed=passed.and.log(rms(nl-1)/rms(nl))/log(2.0_real64)>0.7_real64
   passed=passed.and.log(far(nl-1)/far(nl))/log(2.0_real64)>0.7_real64
