@@ -1,0 +1,12 @@
+# FlowFPM++ benchmark_stairstep_3d: x influence field of a stair-step sphere + FPM terms.
+# Hardware: NVIDIA A100-PCIE-40GB; Intel Xeon Gold 6248R (2 x 24 cores), 16 ranks bound to cores.
+# Compiler: NVIDIA HPC SDK 25.5, one binary (-O2 -acc -gpu=cc80) for CPU and GPU runs.
+# frame_s: median of 3 runs after warm-up of compatibility + 250 Jacobi sweeps + gauge + FPM terms,
+#   including all host-device transfers (GPU: one upload of fields, download of densities and phi).
+# sweep_us: marginal cost of one sweep = (solve at 2500 sweeps - solve at 250 sweeps) / 2250.
+# parity: max |phi_GPU - phi_CPU| over fluid cells at 250 sweeps (1 rank).
+grid,cells,frame_s_cpu1,frame_s_cpu16,frame_s_a100,sweep_us_cpu1,sweep_us_cpu16,sweep_us_a100,parity_linf
+64x64x16,65536,0.02673,0.00625,0.00702,87.7,22.8,19.9,2.8e-17
+128x128x32,524288,0.2182,0.0240,0.0279,720.9,84.0,26.1,2.8e-17
+256x256x64,4194304,3.662,0.2612,0.1862,13428,926.3,115.2,1.7e-17
+512x512x64,16777216,15.18,1.3646,0.7039,,5094,426.0,8.7e-18

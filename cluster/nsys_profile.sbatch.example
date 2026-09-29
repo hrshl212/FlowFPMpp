@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Example Slurm job: Nsight Systems timeline of warm GPU solves (NVTX ranges).
+# Copy this file, then replace every <PLACEHOLDER> for your site.
+#SBATCH --job-name=flowfpm-nsys
+#SBATCH --account=<ACCOUNT>
+#SBATCH --partition=<GPU_PARTITION>
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --mem=16G
+#SBATCH --time=00:15:00
+set -euo pipefail
+module load <NVHPC_MODULE>
+export ACC_DEVICE_TYPE=nvidia
+make acc ACCGPU=<CC>
+nsys profile --trace=cuda,nvtx,openacc --stats=true -o flowfpm_profile \
+     mpirun -np 1 ./build_acc/benchmark_stairstep_3d gpu 256 256 64 250

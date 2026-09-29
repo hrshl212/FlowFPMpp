@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Example Slurm job: OpenACC validation, benchmark, and demo on one GPU.
+# Copy this file, then replace every <PLACEHOLDER> for your site.
+#SBATCH --job-name=flowfpm-gpu
+#SBATCH --account=<ACCOUNT>
+#SBATCH --partition=<GPU_PARTITION>
+#SBATCH --nodes=1
+#SBATCH --ntasks=16
+#SBATCH --cpus-per-task=1
+#SBATCH --gres=gpu:1
+#SBATCH --mem=32G
+#SBATCH --time=00:30:00
+set -euo pipefail
+module load <NVHPC_MODULE>            # NVIDIA HPC SDK with its bundled MPI
+export ACC_DEVICE_TYPE=nvidia
+export UCX_MEMTYPE_CACHE=n
+make acc ACCGPU=<CC>                  # for example ACCGPU=cc80 on A100
+# Correctness on the device.
+mpirun -np 4 ./build_acc/test_mpi_halo_3d_acc
+mpirun -np 1 ./build_acc/test_stairstep_exact_3d openacc
+mpirun -np 4 ./build_acc/test_stairstep_exact_3d openacc
+mpirun -np 1 ./build_acc/test_stairstep_sphere_3d openacc extended
+# Fixed-work benchmark: CPU/GPU parity on one rank, then a 16-rank CPU baseline.
+mpirun -np 1 --bind-to core ./build_acc/benchmark_stairstep_3d benchmark 256 256 64 250
+mpirun -np 16 --bind-to core ./build_acc/benchmark_stairstep_3d cpu 256 256 64 250
+# Demo data for examples/plot_demo.py.
+mpirun -np 1 ./build_acc/demo_cylinder_vortices gpu 360 240 demo_cylinder_vortices.bin

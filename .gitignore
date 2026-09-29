@@ -1,0 +1,10 @@
+build*/
+*.o
+*.mod
+*.bin
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+*.out
+*.err
+__pycache__/

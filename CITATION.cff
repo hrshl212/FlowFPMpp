@@ -1,0 +1,44 @@
+cff-version: 1.2.0
+message: "If you use FlowFPM++, please cite the software and the works below."
+title: "FlowFPM++: MPI + OpenACC force-partitioning influence fields and vortex-induced forces"
+type: software
+authors:
+  - family-names: Raut
+    given-names: Harshal S.
+license: BSD-3-Clause
+references:
+  - type: article
+    title: "Hydrodynamic performance and scaling laws for a modelled wave-induced flapping-foil propulsor"
+    authors:
+      - family-names: Raut
+        given-names: Harshal S.
+      - family-names: Seo
+        given-names: Jung-Hee
+      - family-names: Mittal
+        given-names: Rajat
+    journal: "Journal of Fluid Mechanics"
+    volume: 999
+    start: A1
+    year: 2024
+    doi: 10.1017/jfm.2024.530
+  - type: article
+    title: "A versatile sharp interface immersed boundary method for incompressible flows with complex boundaries"
+    authors:
+      - family-names: Mittal
+        given-names: R.
+      - family-names: Dong
+        given-names: H.
+      - family-names: Bozkurttas
+        given-names: M.
+      - family-names: Najjar
+        given-names: F. M.
+      - family-names: Vargas
+        given-names: A.
+      - family-names: von Loebbecke
+        given-names: A.
+    journal: "Journal of Computational Physics"
+    volume: 227
+    start: 4825
+    end: 4852
+    year: 2008
+    doi: 10.1016/j.jcp.2008.01.028
