@@ -17,6 +17,9 @@ module fpm_partition_2d
   !   a_B = (k4 - k6 y - k3^2 x, k5 + k6 x - k3^2 y), and convective
   !   acceleration (U_B.grad)U_B = k3 z x U_B; phi is extrapolated to the face
   !   with the prescribed face gradient;
+  ! - with slip_body (for kinematic test flows that do not satisfy no-slip), body
+  !   faces instead take the cell's own velocity and (u.grad)u, and carry no
+  !   viscous flux;
   ! - outer faces use zero normal gradient for u and phi;
   ! - Du/Dt on the outer boundary is (u(t+dt) - u(t-dt))/(2 dt) + (u.grad)u.
   use,intrinsic :: iso_fortran_env,only:real64
@@ -29,15 +32,18 @@ contains
   ! east column, south row, north row) of component c=1 (u), 2 (v) at t=1
   ! (previous) and t=2 (next snapshot). terms = [KINE, VIF, VIS, BOUND].
   ! Outputs the F_VIF density phi*div[(u.grad)u] and the vorticity (zero in solid).
-  subroutine fpm_partition_terms_2d(phi,g,u,v,solid,xf,yf,kin,ring,dt,nu,nx,ny,terms,vif_density,omega)
+  subroutine fpm_partition_terms_2d(phi,g,u,v,solid,xf,yf,kin,ring,dt,nu,nx,ny,terms,vif_density,omega,slip_body)
     integer,intent(in)::nx,ny
     real(real64),intent(in)::phi(nx,ny),g(2),u(nx,ny),v(nx,ny),xf(0:nx),yf(0:ny),kin(6)
     real(real64),intent(in)::ring(2*nx+2*ny,2,2),dt,nu
     logical,intent(in)::solid(nx,ny)
     real(real64),intent(out)::terms(4),vif_density(nx,ny),omega(nx,ny)
+    logical,intent(in),optional::slip_body
     real(real64),allocatable::xc(:),yc(:),dx(:),dy(:),nxf(:,:),nyf(:,:),gpx(:,:),gpy(:,:)
     real(real64)::fu(4),fv(4),fp(4),div,lapu,lapv,hw,d,fx,fy,phif,ax,ay,ubx,uby,len,sgn,dudt,dvdt,nn
     integer::i,j,f,ii,jj,axis,m
+    logical::slip
+    slip=.false.;if(present(slip_body))slip=slip_body
     allocate(xc(nx),yc(ny),dx(nx),dy(ny),nxf(nx,ny),nyf(nx,ny),gpx(nx,ny),gpy(nx,ny))
     dx=xf(1:nx)-xf(0:nx-1);dy=yf(1:ny)-yf(0:ny-1)
     xc=0.5_real64*(xf(0:nx-1)+xf(1:nx));yc=0.5_real64*(yf(0:ny-1)+yf(1:ny))
@@ -50,7 +56,8 @@ contains
         if(ii<1.or.ii>nx.or.jj<1.or.jj>ny)then          ! outer face
           fu(f)=u(i,j);fv(f)=v(i,j);fp(f)=0
         elseif(solid(ii,jj))then                       ! body face
-          call body_velocity(fx,fy,fu(f),fv(f))
+          if(slip)then;fu(f)=u(i,j);fv(f)=v(i,j)
+          else;call body_velocity(fx,fy,fu(f),fv(f));endif
           fp(f)=g(axis)
         else                                           ! interior face, linear interpolation
           fu(f)=u(i,j)+(u(ii,jj)-u(i,j))*hw/d
@@ -84,8 +91,12 @@ contains
           call body_acceleration(fx,fy,ax,ay)
           phif=phi(i,j)+sgn*hw*g(axis)
           terms(1)=terms(1)-sgn*merge(ax,ay,axis==1)*phif*len
-          div=div+sgn*merge(-kin(3)*uby,kin(3)*ubx,axis==1)*len
-          lapu=lapu+(ubx-u(i,j))/hw*len;lapv=lapv+(uby-v(i,j))/hw*len
+          if(slip)then
+            div=div+sgn*merge(nxf(i,j),nyf(i,j),axis==1)*len
+          else
+            div=div+sgn*merge(-kin(3)*uby,kin(3)*ubx,axis==1)*len
+            lapu=lapu+(ubx-u(i,j))/hw*len;lapv=lapv+(uby-v(i,j))/hw*len
+          endif
         else
           div=div+sgn*merge(nxf(i,j)+(nxf(ii,jj)-nxf(i,j))*hw/d,nyf(i,j)+(nyf(ii,jj)-nyf(i,j))*hw/d,axis==1)*len
           lapu=lapu+(u(ii,jj)-u(i,j))/d*len;lapv=lapv+(v(ii,jj)-v(i,j))/d*len

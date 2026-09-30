@@ -293,7 +293,8 @@ core, force partition, benchmark, and tests in this repository are new.
 *Synthetic demo (`examples/demo_cylinder_vortices.f90`): a stair-step
 cylinder in a street of Lamb-Oseen vortices, a prescribed kinematic flow,
 showing the vortex-induced force density `phi_i div[(u . grad) u]`.
-F_VIF = (+0.270, -0.127). It runs in 0.5 s on one A100 and 3.6 s on one CPU core.*
+F_VIF = (+0.205, +0.061). The prescribed flow does not satisfy no-slip, so
+the cylinder's faces are treated as slip faces (`slip_body`). It runs in 0.5 s on one A100 and 3.6 s on one CPU core.*
 
 ## Build and run
 

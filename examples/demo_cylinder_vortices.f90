@@ -5,7 +5,9 @@ program demo_cylinder_vortices
   ! uniform stream plus a staggered row of Lamb-Oseen vortices. The flow is a
   ! prescribed kinematic input, not a Navier-Stokes solution. The case is 2-D:
   ! two z cells with zero z-face derivatives. The cylinder is stationary and the
-  ! flow steady and treated as inviscid, so F_KINE and F_VIS vanish; since the
+  ! flow steady and treated as inviscid, so F_KINE and F_VIS vanish. The
+  ! prescribed flow does not satisfy no-slip, so the body faces are treated as
+  ! slip faces (slip_body) to avoid a spurious wall layer. Since the
   ! flow is not a Navier-Stokes solution, the terms are not balanced by a
   ! pressure force.
   ! Usage: demo_cylinder_vortices [cpu|gpu [gnx gny [output]]]  (one MPI rank)
@@ -83,7 +85,7 @@ program demo_cylinder_vortices
     call solve_stairstep_poisson_3d(phi(:,:,:,d),rhs,solid,body,xlo,xhi,ylo,yhi,zlo,zhi,xc,yc,zc,dx,dy,dz, &
          nx,ny,nz,west,east,south,north,cart,1.0e-9_real64,5000000,500,sweeps(d),residual,use_openacc=gpu)
     call fpm_partition_terms_2d(phi(1:nx,1:ny,1,d),body(1:2),u(:,:,1),v(:,:,1),lsolid,xf,yf,kin0, &
-         ring,1.0_real64,0.0_real64,nx,ny,totals(:,d),vortex(:,:,1,d),omega2)
+         ring,1.0_real64,0.0_real64,nx,ny,totals(:,d),vortex(:,:,1,d),omega2,slip_body=.true.)
     write(output_unit,'(a,i0,a,i0,a,es11.3,a,es11.3)')'direction ',d,': sweeps ',sweeps(d), &
          ', residual ',residual,', compatibility correction ',correction
   enddo
