@@ -1,5 +1,6 @@
-"""Plot a FlowFPM++ example output (demo_cylinder_vortices or foil_frame_fpm):
-vorticity and the x/y vortex-induced force densities, with influence-potential
+"""Plot a FlowFPM++ example output (demo_cylinder_vortices or flapping_foil_fpm):
+vorticity and the x/y vortex-induced force (F_VIF) densities phi_i div[(u.grad)u],
+with influence-potential
 contour lines (dashed where negative) on the force panels.
 Usage: python plot_fields.py IN.bin OUT.png [x0 x1 y0 y1 [vorticity title]]"""
 import sys
@@ -20,8 +21,8 @@ with open(path, "rb") as f:
 ink = "#3b3b38"
 panels = [
     (oz, None, r"$\omega_z$", vorticity_title),
-    (fx, phix, r"$-(\omega\times u)\cdot\nabla\phi_x$", r"Vortex-induced force density, x (drag), with $\phi_x$"),
-    (fy, phiy, r"$-(\omega\times u)\cdot\nabla\phi_y$", r"Vortex-induced force density, y (lift), with $\phi_y$"),
+    (fx, phix, r"$\phi_x\,\nabla\cdot[(u\cdot\nabla)u]$", r"$F_{VIF}$ density, x (drag), with $\phi_x$"),
+    (fy, phiy, r"$\phi_y\,\nabla\cdot[(u\cdot\nabla)u]$", r"$F_{VIF}$ density, y (lift), with $\phi_y$"),
 ]
 fig, axes = plt.subplots(3, 1, figsize=(7.5, 8.4), sharex=True, constrained_layout=True)
 for ax, (field, potential, label, title) in zip(axes, panels):

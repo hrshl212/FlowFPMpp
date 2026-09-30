@@ -27,4 +27,4 @@ mpirun -np 16 --bind-to core ./build_acc/benchmark_stairstep_3d cpu 256 256 64 2
 mpirun -np 1 ./build_acc/benchmark_stairstep_3d gpu 256 256 64 4000000 pcg 1e-8
 # Demo and real-frame example outputs for examples/plot_fields.py.
 mpirun -np 1 ./build_acc/demo_cylinder_vortices gpu 360 240 demo_cylinder_vortices.bin
-mpirun -np 1 ./build_acc/foil_frame_fpm gpu examples/data/foil_frame_18400.bin foil_frame_fpm.bin
+mpirun -np 1 ./build_acc/flapping_foil_fpm gpu examples/data/flapping_foil_216000.bin flapping_foil_fpm.bin

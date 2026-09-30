@@ -15,14 +15,14 @@ ACCGPU ?= cc80
 ACC_DIR ?= build_acc
 ACCFLAGS ?= -O2 -acc -gpu=$(ACCGPU) -Minfo=accel
 
-CORE := src/fpm_trace.f90 src/fpm_halo_mpi_3d.f90 src/fpm_stairstep_mpi_3d.f90 tests/fpm_test_grid.f90
-CORE_ACC := src/fpm_trace_nvtx.f90 src/fpm_halo_mpi_3d.f90 src/fpm_stairstep_mpi_3d.f90 tests/fpm_test_grid.f90
-MPI_PROGRAMS := test_stairstep_exact_3d test_stairstep_sphere_3d benchmark_stairstep_3d
+CORE := src/fpm_trace.f90 src/fpm_halo_mpi_3d.f90 src/fpm_stairstep_mpi_3d.f90 src/fpm_partition_2d.f90 tests/fpm_test_grid.f90
+CORE_ACC := src/fpm_trace_nvtx.f90 src/fpm_halo_mpi_3d.f90 src/fpm_stairstep_mpi_3d.f90 src/fpm_partition_2d.f90 tests/fpm_test_grid.f90
+MPI_PROGRAMS := test_stairstep_exact_3d test_stairstep_sphere_3d test_fpm_partition_2d benchmark_stairstep_3d
 
 .PHONY: all test mpi-tests acc foil clean
 
 all: $(BUILD_DIR)/test_fpm_3d $(BUILD_DIR)/test_fpm_3d_nonuniform $(BUILD_DIR)/test_mpi_halo_3d \
-	$(addprefix $(BUILD_DIR)/,$(MPI_PROGRAMS)) $(BUILD_DIR)/demo_cylinder_vortices $(BUILD_DIR)/foil_frame_fpm
+	$(addprefix $(BUILD_DIR)/,$(MPI_PROGRAMS)) $(BUILD_DIR)/demo_cylinder_vortices $(BUILD_DIR)/flapping_foil_fpm
 
 $(BUILD_DIR)/test_fpm_3d: src/fpm_laplace_3d.f90 src/fpm_terms_3d.f90 tests/test_fpm_3d.f90
 	@mkdir -p $(BUILD_DIR)
@@ -44,13 +44,13 @@ $(BUILD_DIR)/demo_cylinder_vortices: $(CORE) examples/demo_cylinder_vortices.f90
 	@mkdir -p $(BUILD_DIR)
 	$(MPIFC) $(FFLAGS) $(MODFLAGS) -I$(BUILD_DIR) $^ -o $@
 
-$(BUILD_DIR)/foil_frame_fpm: $(CORE) examples/foil_frame_fpm.f90
+$(BUILD_DIR)/flapping_foil_fpm: $(CORE) examples/flapping_foil_fpm.f90
 	@mkdir -p $(BUILD_DIR)
 	$(MPIFC) $(FFLAGS) $(MODFLAGS) -I$(BUILD_DIR) $^ -o $@
 
-# Real-frame example (examples/data/foil_frame_18400.bin): writes foil_frame_fpm.bin.
-foil: $(BUILD_DIR)/foil_frame_fpm
-	$(MPIEXEC) -np 1 $(BUILD_DIR)/foil_frame_fpm cpu
+# Real-frame example (examples/data/flapping_foil_216000.bin): force partition, writes flapping_foil_fpm.bin.
+foil: $(BUILD_DIR)/flapping_foil_fpm
+	$(MPIEXEC) -np 1 $(BUILD_DIR)/flapping_foil_fpm cpu
 
 # Serial manufactured-solution tests.
 test: $(BUILD_DIR)/test_fpm_3d $(BUILD_DIR)/test_fpm_3d_nonuniform
@@ -58,15 +58,17 @@ test: $(BUILD_DIR)/test_fpm_3d $(BUILD_DIR)/test_fpm_3d_nonuniform
 	$(BUILD_DIR)/test_fpm_3d_nonuniform
 
 # MPI tests (host execution); about one minute on four cores.
-mpi-tests: $(BUILD_DIR)/test_mpi_halo_3d $(BUILD_DIR)/test_stairstep_exact_3d $(BUILD_DIR)/test_stairstep_sphere_3d
+mpi-tests: $(BUILD_DIR)/test_mpi_halo_3d $(BUILD_DIR)/test_stairstep_exact_3d $(BUILD_DIR)/test_stairstep_sphere_3d \
+	$(BUILD_DIR)/test_fpm_partition_2d
 	$(MPIEXEC) -np 4 $(BUILD_DIR)/test_mpi_halo_3d
 	$(MPIEXEC) -np 1 $(BUILD_DIR)/test_stairstep_exact_3d
 	$(MPIEXEC) -np 4 $(BUILD_DIR)/test_stairstep_exact_3d
 	$(MPIEXEC) -np 4 $(BUILD_DIR)/test_stairstep_sphere_3d
+	$(MPIEXEC) -np 1 $(BUILD_DIR)/test_fpm_partition_2d
 
 # OpenACC builds; the same programs take an "openacc" or "gpu" argument.
 acc: $(ACC_DIR)/test_mpi_halo_3d_acc $(addprefix $(ACC_DIR)/,$(MPI_PROGRAMS)) $(ACC_DIR)/demo_cylinder_vortices \
-	$(ACC_DIR)/foil_frame_fpm
+	$(ACC_DIR)/flapping_foil_fpm
 
 $(ACC_DIR)/test_mpi_halo_3d_acc: src/fpm_halo_mpi_3d.f90 tests/test_mpi_halo_3d_acc.f90
 	@mkdir -p $(ACC_DIR)
@@ -80,7 +82,7 @@ $(ACC_DIR)/demo_cylinder_vortices: $(CORE_ACC) examples/demo_cylinder_vortices.f
 	@mkdir -p $(ACC_DIR)
 	$(ACC_MPIFC) $(ACCFLAGS) -cudalib=nvtx -module $(ACC_DIR) -I$(ACC_DIR) $^ -o $@
 
-$(ACC_DIR)/foil_frame_fpm: $(CORE_ACC) examples/foil_frame_fpm.f90
+$(ACC_DIR)/flapping_foil_fpm: $(CORE_ACC) examples/flapping_foil_fpm.f90
 	@mkdir -p $(ACC_DIR)
 	$(ACC_MPIFC) $(ACCFLAGS) -cudalib=nvtx -module $(ACC_DIR) -I$(ACC_DIR) $^ -o $@
 

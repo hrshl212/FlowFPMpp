@@ -3,14 +3,15 @@
 Force-partitioning influence fields and vortex-induced forces on CPUs and
 NVIDIA GPUs, in Fortran 2018 with MPI and OpenACC.
 
-![Vorticity and vortex-induced force densities around a flapping foil](docs/images/foil_frame_stairstep.png)
+![Vorticity and vortex-induced force densities around a passive-flapping foil](docs/images/flapping_foil_216000.png)
 
-*Real data, reproducible from this repository (`make foil`): one frame of a
-2-D flapping-foil simulation computed with the VICAR3D code, with the foil as
-a stair-step body. Top: vorticity. Middle and bottom: vortex-induced force
-density for drag and lift, with the influence potentials phi_x and phi_y as
-contour lines (dashed where negative). Tens of seconds on one CPU core, about
-2 s on one A100.*
+*Real data, reproducible from this repository (`make foil`): one frame (t = 172.8)
+of a 2-D heaving and passively pitching foil simulated with the VICAR3D code
+(Re = 1e4), with the foil as a stair-step body. Top: vorticity. Middle and
+bottom: vortex-induced force density for drag and lift, with the influence
+potentials phi_x and phi_y as contour lines (dashed where negative). All four
+force-partitioning terms are reported below. About 4 minutes on one CPU core,
+6 s on one A100.*
 
 ## What it computes
 
@@ -25,16 +26,28 @@ n . grad(phi_i)  = n_i        on the body surface
 n . grad(phi_i)  = 0          on the outer boundary
 ```
 
-The vortex-induced force is then a volume integral over the fluid:
+Projecting the momentum equation onto `grad(phi_i)` splits the pressure force
+into four terms (Raut, Seo & Mittal 2024, eq. 2.7; `n` points out of the fluid):
 
 ```
-F_i(vortex) = -rho * integral_fluid (omega x u) . grad(phi_i) dV
+F_i = F_KINE + F_VIF + F_VIS + F_BOUND
+F_KINE  = - rho * surface_integral_B     (n . dU_B/dt) phi_i dS     body acceleration
+F_VIF   =   rho * integral_fluid  phi_i div[(u . grad) u] dV        vortex-induced force
+F_VIS   =   mu  * integral_fluid  lap(u) . grad(phi_i) dV           viscous
+F_BOUND = - rho * surface_integral_Sigma (n . Du/Dt) phi_i dS       outer boundary
 ```
 
-FlowFPM++ solves for `phi_i` and evaluates the local densities
-`-(omega x u) . grad(phi_i)` and `-a . grad(phi_i)` (for a supplied field `a`)
-together with their integrals (per unit density). It does not include the
-surface terms of the full FPM decomposition.
+The paper writes the vortex-induced force as `-2 rho integral Q phi_i dV`. For
+incompressible flow `div[(u . grad) u] = -2Q`, and FlowFPM++ uses this
+divergence form, evaluated with face fluxes. Discretely, the pointwise Q of the
+velocity field is not the divergence of the advection term in the first cell
+layer along the wall, where `phi_i` is largest. That discrepancy is enough to
+spoil the force balance, while the divergence form closes it.
+
+FlowFPM++ solves for `phi_i`, evaluates the four terms
+(`src/fpm_partition_2d.f90`, 2-D bodies in rigid in-plane motion), and also
+provides the local densities `-(omega x u) . grad(phi_i)` and `-a . grad(phi_i)`
+for general 3-D fields (`compute_stairstep_fpm_terms_3d`).
 
 ### Discretization
 
@@ -55,7 +68,8 @@ surface terms of the full FPM decomposition.
   the constants as its null space. Compatibility keeps the right-hand side
   orthogonal to them, and a diagonal preconditioner is applied. At every
   convergence check the recursively updated residual is replaced by the true
-  one, which keeps the iteration stable near roundoff. The alternative is
+  one, which keeps the iteration stable near roundoff. If the requested tolerance
+  is below the roundoff floor, PCG stops once the residual stagnates. The alternative is
   weighted Jacobi, `phi <- 0.2 phi + 0.8 (sum(a_nb phi_nb) - f) / sum(a_nb)`,
   whose damping removes the checkerboard two-cycle of plain Jacobi on this
   operator. Jacobi is kept as the bandwidth benchmark. Both stop on the same
@@ -122,15 +136,45 @@ The observed order approaches 1 for all three quantities (1.09, 1.07, and
 stair-step body: usable, but a sharp-interface method would be needed for
 precise surface quantities.
 
-**Real frame** (`examples/foil_frame_fpm.f90`, `make foil`). The frame is
-cropped to 741x518 cells around the foil and wake, and 2,597 of them are
-solid. The influence fields are solved on the cropped domain, with zero normal
-derivative on its outer boundary. The stair-step x vortex-induced force over
-the crop is -2.131e-2 (per unit span and density). The VICAR3D code's own
-value for the same crop is -1.788e-2. Its influence field comes from the full
-domain and a sharp-interface body. The 19% difference combines the crop and
-the stair-step body, and shows what the simpler geometry costs on a real,
-thin foil. CPU and GPU give identical integrals to eight digits.
+**Force-partitioning terms** (`tests/test_fpm_partition_2d.f90`):
+- for solid-body rotation, the discrete `div[(u . grad) u]` equals `-2 Omega^2`
+  to 3e-14;
+- for uniform flow, every term vanishes exactly;
+- for a stair-step cylinder of radius 10h accelerating through fluid at rest,
+  `-F_KINE` gives an added-mass coefficient of 1.14 against the exact 1. Like
+  the sphere study, the stair-step body overestimates added mass, and the
+  estimate converges from above.
+
+**Real frame** (`examples/flapping_foil_fpm.f90`, `make foil`). The example is
+step 216000 (t = 172.8) of a 2-D VICAR3D simulation of a heaving foil that
+pitches passively and has an angle limiter (7.5 degrees). The domain is
+600x1250 cells over x 0-10 and y 0-13, and 3,321 of them are solid.
+- **phi solves:** `phi_x` and `phi_y` are solved on the full domain; PCG takes
+  8,450 and 11,150 iterations.
+- **Body motion:** at this instant the pitch is locked by the limiter, so the
+  foil is in pure heave with velocity -0.622.
+- **Body acceleration:** 0.189 (upward), from a quintic Hermite fit through
+  marker positions and velocities at t = 171.2, 172.8, and 174.4. It is the
+  least certain input: other estimates from the same data range from 0.14 to
+  0.27.
+- **F_BOUND:** `du/dt` on the outer boundary comes from the dumps at t = 172.4
+  and 173.2.
+
+Terms per unit span and density, in the simulation's units (freestream 1,
+chord 1):
+
+| Term | x (drag direction) | y (lift direction) |
+|---|---|---|
+| F_KINE (body acceleration) | +1.900e-2 | -1.480e-1 |
+| F_VIF (vortex-induced) | -4.606e-2 | +7.444e-1 |
+| F_VIS (viscous) | +9.73e-4 | +7.33e-3 |
+| F_BOUND (outer boundary) | -3.61e-4 | +3.31e-3 |
+| Sum (pressure force) | -2.645e-2 | +6.071e-1 |
+
+The vortex-induced force dominates the lift. It comes mostly from the
+leading-edge vortex pair and the separated shear layer over the suction side,
+partly offset by the acceleration-reaction term. CPU and GPU runs give
+identical terms to six digits.
 
 **CPU/GPU parity.** On every benchmark grid the GPU field matches the CPU
 field to a maximum difference of 2.8e-17 for fixed work, and 2.5e-16 for PCG
@@ -226,11 +270,14 @@ Two correctness problems were found on the way and fixed:
   multigrid preconditioner would cut this further.
 - **Scaling not measured beyond one GPU.** MPI messages are host-staged (no
   GPU-aware MPI), and multi-GPU scaling has not been measured.
-- **Volume terms only.** The code computes the vortex-induced and advection
-  volume terms, not the surface terms of the full FPM decomposition.
-- **Synthetic demo.** The cylinder demo's flow is kinematic, not a flow solution.
-- **Cropped real frame.** The example frame is a crop, and its outer boundary
-  affects phi.
+- **Force-partitioning terms in 2-D only.** `fpm_partition_terms_2d` covers
+  2-D bodies in rigid in-plane motion on one rank; the 3-D API provides the
+  local densities only.
+- **Body acceleration.** F_KINE needs the instantaneous body acceleration. The
+  example derives it from marker files saved every 2,000 steps, so F_KINE (and
+  the sum) inherits that uncertainty.
+- **Synthetic demo.** The cylinder demo's flow is kinematic, not a flow solution,
+  so its terms are not balanced by a pressure force.
 
 ## Background
 
@@ -239,21 +286,14 @@ postprocessor for VICAR3D immersed-boundary simulations. That private code
 base is built around the VICAR3D code and is not included here. On a production 3-D frame of about 87 million cells, its
 OpenACC solve agreed with the CPU reference to 5.7e-17 and ran in 0.91 s on
 one A100, against 12.2 s for a single CPU rank. The body treatment, solver
-core, benchmark, and tests in this repository are new.
-
-![Vorticity and x-direction vortex-induced force density around a flapping foil](docs/images/vicar3d_foil_frame.png)
-
-*The same frame (timestep 18400) as evaluated by the private postprocessor,
-with the influence field of the VICAR3D code on the full domain. Top:
-vorticity. Bottom: x-direction vortex-induced force density; its integral
-matches the stored VICAR3D result to 2e-15. Compare the middle panel of the
-figure at the top of this page.*
+core, force partition, benchmark, and tests in this repository are new.
 
 ![Vorticity and vortex-induced force density around a stair-step cylinder](docs/images/demo_cylinder_vortices.png)
 
 *Synthetic demo (`examples/demo_cylinder_vortices.f90`): a stair-step
-cylinder in a street of Lamb-Oseen vortices, a prescribed kinematic flow.
-0.6 s on one A100, 2 s on one CPU core.*
+cylinder in a street of Lamb-Oseen vortices, a prescribed kinematic flow,
+showing the vortex-induced force density `phi_i div[(u . grad) u]`.
+F_VIF = (+0.270, -0.127). It runs in 0.5 s on one A100 and 3.6 s on one CPU core.*
 
 ## Build and run
 
@@ -263,8 +303,8 @@ CPU build, tests, and the real-frame example use GNU Fortran and Open MPI
 ```sh
 make test FC=gfortran
 make mpi-tests FC=gfortran MPIFC=mpifort MPIEXEC="mpirun --oversubscribe"
-make foil FC=gfortran MPIFC=mpifort             # writes foil_frame_fpm.bin
-python examples/plot_fields.py foil_frame_fpm.bin foil.png 59 67 66.9 69.4 "Vorticity"
+make foil FC=gfortran MPIFC=mpifort             # prints the terms, writes flapping_foil_fpm.bin
+python examples/plot_fields.py flapping_foil_fpm.bin foil.png 4.2 7.4 5.65 6.95 "Vorticity"
 ```
 
 The plotting script needs numpy and matplotlib.
@@ -277,7 +317,7 @@ mpirun -np 1 ./build_acc/test_stairstep_exact_3d openacc
 mpirun -np 1 ./build_acc/test_stairstep_sphere_3d openacc extended
 mpirun -np 1 ./build_acc/benchmark_stairstep_3d benchmark 256 256 64 250
 mpirun -np 1 ./build_acc/benchmark_stairstep_3d gpu 256 256 64 4000000 pcg 1e-8
-mpirun -np 1 ./build_acc/foil_frame_fpm gpu
+mpirun -np 1 ./build_acc/flapping_foil_fpm gpu
 mpirun -np 1 ./build_acc/demo_cylinder_vortices gpu 360 240 demo.bin
 python examples/plot_fields.py demo.bin demo.png
 ```
@@ -290,12 +330,22 @@ Slurm scripts with placeholders are in [`cluster/`](cluster/).
 
 ### Example data format
 
-`examples/data/foil_frame_18400.bin` (10.8 MB) is a Fortran stream file,
-little-endian: `character(8) 'FFPM2D01'`, `int32 nx, ny`,
-`real64 xf(0:nx), yf(0:ny)` (cell faces), `real64 u(nx,ny), v(nx,ny),
-omega_z(nx,ny)`, and `int32 solid(nx,ny)` (1 inside the foil). Arrays are
-column-major (x fastest). The frame spans x 58.38-67.50 and y 66.80-69.59,
-with widths from 0.0048 to 0.26.
+`examples/data/flapping_foil_216000.bin` (12.9 MB) is a little-endian Fortran
+stream file. Arrays are column-major (x fastest). It contains, in order:
+- `character(8) 'FFPM2D02'`, then `int32 nx, ny`;
+- `real64 xf(0:nx), yf(0:ny)`, the cell faces;
+- `real64 u(nx,ny), v(nx,ny)` at t = 172.8;
+- `int8 solid(nx,ny)`, which is 1 inside the foil;
+- `real64 dt` (0.4);
+- `real64 ring(2*nx+2*ny, 2, 2)`: u and v in the outer-boundary cells (west
+  column, east column, south row, north row) at t - dt and t + dt, used for
+  `du/dt` in F_BOUND;
+- `real64 kin(6)`, the rigid body motion: velocity
+  `U_B = (k1 - k3 y, k2 + k3 x)` and acceleration
+  `a_B = (k4 - k6 y - k3^2 x, k5 + k6 x - k3^2 y)`;
+- `real64 time`.
+
+Cell widths range from 0.004 near the foil to 0.22.
 
 ## Repository layout
 
@@ -303,8 +353,8 @@ with widths from 0.0048 to 0.26.
 |---|---|
 | `src/` | Stair-step solver and force terms, halo exchange, serial 3-D kernels, NVTX wrappers |
 | `tests/` | Self-contained tests and the benchmark |
-| `examples/` | Real-frame foil example, cylinder demo, plotting script |
-| `examples/data/` | One cropped frame of a VICAR3D flapping-foil simulation (format below) |
+| `examples/` | Passive-flapping foil example (force partition), cylinder demo, plotting script |
+| `examples/data/` | One frame of a VICAR3D passive-flapping foil simulation (format below) |
 | `benchmarks/` | Measured benchmark results |
 | `docs/` | Provenance statement and figures |
 | `cluster/` | Example Slurm scripts |

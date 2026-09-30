@@ -98,7 +98,8 @@ contains
   !   'jacobi': weighted Jacobi, phi <- 0.2 phi + 0.8 (sum(a_nb phi_nb) - f) / sum(a_nb).
   ! Both stop when the max-norm residual of L(phi)-f, checked every
   ! check_interval iterations, is at most tolerance (a negative tolerance runs
-  ! exactly max_sweeps iterations). Prescribed outer and body face gradients are
+  ! exactly max_sweeps iterations; PCG also stops at its roundoff floor, after 50
+  ! checks without a 1% improvement). Prescribed outer and body face gradients are
   ! folded once into a source term and solid and outer neighbours are dropped
   ! from the diagonal; solid cells stay at zero, so the kernels read no masks.
   ! solid must have a current halo.
@@ -233,12 +234,13 @@ contains
     ! restarts from the steepest-descent direction.
     subroutine pcg_iterate()
       real(real64)::rz,rz_new,pq,alpha,beta,vol,res
-      integer::it,i,j,k,ierr,n1,n2,n3,restarts
+      real(real64)::best
+      integer::it,i,j,k,ierr,n1,n2,n3,restarts,stalled
       ! The residual is passed back explicitly: NVHPC OpenACC builds did not see
       ! an update of the host-associated residual made in a sibling procedure.
       n1=nx;n2=ny;n3=nz
       call true_residual(.true.,rz,res)
-      it=0;restarts=0
+      it=0;restarts=0;stalled=0;best=res
       do while(sweeps<max_sweeps.and.res>tolerance)
         call exchange(next)
         pq=0
@@ -253,7 +255,8 @@ contains
         enddo;enddo;enddo
         !$acc end parallel loop
         call MPI_Allreduce(MPI_IN_PLACE,pq,1,MPI_DOUBLE_PRECISION,MPI_SUM,comm,ierr)
-        if(pq<=0.or.rz<=0)then
+        ! The negated tests are also true for NaN.
+        if(.not.(pq>0).or..not.(rz>0))then
           ! Breakdown (converged to roundoff or lost conjugacy): restart once.
           restarts=restarts+1
           if(restarts>1)exit
@@ -271,6 +274,7 @@ contains
         enddo;enddo;enddo
         !$acc end parallel loop
         call MPI_Allreduce(MPI_IN_PLACE,rz_new,1,MPI_DOUBLE_PRECISION,MPI_SUM,comm,ierr)
+        if(.not.(rz_new>=0))exit
         beta=rz_new/rz;rz=rz_new
         !$acc parallel loop collapse(3) present(next,r,rdiag) if(accelerate)
         do k=1,n3;do j=1,n2;do i=1,n1
@@ -278,7 +282,12 @@ contains
         enddo;enddo;enddo
         !$acc end parallel loop
         sweeps=sweeps+1;it=it+1
-        if(mod(it,max(1,check_interval))==0.or.sweeps==max_sweeps)call true_residual(.false.,rz,res)
+        if(mod(it,max(1,check_interval))==0.or.sweeps==max_sweeps)then
+          call true_residual(.false.,rz,res)
+          ! Stop at the roundoff floor: no 1% improvement over 50 checks.
+          if(res<0.99_real64*best)then;best=res;stalled=0;else;stalled=stalled+1;endif
+          if(stalled>=50.or..not.(res==res))exit
+        endif
       enddo
       residual=res
     end subroutine pcg_iterate
