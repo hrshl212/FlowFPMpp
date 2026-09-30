@@ -23,7 +23,7 @@ with open(path, "rb") as f:
 ink = "#3b3b38"
 
 
-def colour_limit(values, floor=0.02, pct=80):
+def colour_limit(values, floor=0.02, pct=50):
     """Symmetric colour limit set by the flow structures rather than by a few
     near-wall peaks: the pct-th percentile of |value| over the cells whose
     magnitude exceeds `floor` times the 99.9th percentile. Values beyond the
